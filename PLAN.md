@@ -23,7 +23,7 @@ A Dropbox-like sync tool, Linux server + Linux clients, with:
 | Storage on client | Plain files | Plain files (sync client), or FUSE cache (SeaDrive) | **Plain files; unfetched ones are sparse placeholders** |
 | Topology | P2P mesh, symmetric | Client/server | **Hub: one authoritative server, many clients (on the Syncthing protocol)** |
 | Selective sync | Ignore patterns only (a file is either fully there or invisible) | Per-library/sub-folder sync; SeaDrive gives on-demand files through FUSE | **Three states per path: ignored / online-only / local, plus an LRU cache budget** |
-| On-demand mechanism | — | FUSE (every I/O goes through userspace) | **fanotify pre-content events (kernel ≥ 6.14); FUSE passthrough as fallback** |
+| On-demand mechanism | — | FUSE (every I/O goes through userspace) | **fanotify pre-content events (kernel ≥ 6.14 required)** |
 | Change detection | inotify per directory, plus periodic full scans | inotify | **fanotify filesystem/mount marks (no per-directory watch limit)** |
 | History/versioning | Per-folder versioning into `.stversions` | Built into the object model | **btrfs/ZFS snapshots on the server, plus Syncthing-style versioning as a fallback** |
 | Dedup | None | Block-level via CDC | **Reflinks / offline dedup (duperemove) on the server filesystem** |
@@ -68,9 +68,9 @@ allows the access.
 Prior art proving it works: [franzjeger/HydrationAPI](https://github.com/franzjeger/HydrationAPI) implements a
 OneDrive client this way. It passes its invariants on btrfs, ext4, and xfs. Its findings are in Section 4.6.
 
-**Fallback:** a FUSE mode using **FUSE passthrough** (kernel ≥ 6.9), which gives near-native reads/writes on hydrated
-files, for kernels older than 6.14 and filesystems without HSM support. Syncthing's model and protocol are the same in
-both modes; only the "placeholder backend" interface differs.
+**No fallback.** Clients must run a kernel with fanotify pre-content support (≥ 6.14) on ext4, xfs or btrfs. On
+anything else, an on-demand folder refuses to start (it reports a folder error) rather than degrading. A plain
+send-receive folder still works there, but it downloads everything.
 
 ## 4. Architecture
 
@@ -200,7 +200,7 @@ file.
 Fork from the latest **v2.x** tag. Keep the changes in new packages so we can keep merging upstream:
 
 - `lib/config`: new folder type `virtual` (client), `hub` presets (disable global discovery/relays optionally, one
-  trusted introducer = server). New options: `cacheBudget`, `pinPatterns`, `hsmBackend=fanotify|fuse`.
+  trusted introducer = server). New options: `onDemand`, `onDemandView`, `cacheBudget`, `pinPatterns`.
 - `lib/db` (SQLite): `FlagLocalVirtual`, per-file block bitmap table, pin table, inode↔file ID table, LRU table.
   **Index-sending code must never announce virtual/partial files as "have".** The pattern is how `FlagLocalReceiveOnly`
   and `FlagLocalIgnored` are filtered today.
@@ -211,8 +211,7 @@ Fork from the latest **v2.x** tag. Keep the changes in new packages so we can ke
     to a placeholder (policy).
 - `lib/scanner`: skips hashing virtual files. Detects renames of virtual files via file ID. Detects "was virtual, now
   locally written" transitions.
-- `lib/hsm` (new): backend interface `{CreatePlaceholder, Hydrate(range), Evict, State}` with `fanotify` and `fuse`
-  implementations.
+- `lib/hsm` (new): the fanotify pre-content listener plus placeholder helpers (mark, hydrate, evict).
 - `lib/fs`: fanotify-based watcher (`lib/fs/fanotify_linux.go`) beside the existing notify-based one.
 - `cmd/tether-hsmd` (new): the small privileged helper. Go with `golang.org/x/sys/unix` (add the missing pre-content
   constants and structs), or Rust if we want the privileged part minimal and memory-safe. **Decision: Go** for one
@@ -227,7 +226,7 @@ hints") are negotiated via a hello option.
 
 | Phase | Goal | Exit criteria |
 |---|---|---|
-| **0. Spikes (2–3 wks)** | Validate the kernel mechanism before touching Syncthing | A C/Go prototype on 6.14+ over ext4, xfs, btrfs hydrates on `read`, `mmap` (read + write fault), `exec`, `sendfile`, `splice`, `copy_file_range`, `io_uring` read, `O_DIRECT`. Measure the first-byte latency added. Confirm listener-absent behaviour, `FAN_DENY` errno, lease-based eviction, and range semantics on overlapping events. Parallel spike: FUSE-passthrough backend. Read HydrationAPI's conformance tests and SeaDrive's cache logic |
+| **0. Spikes (2–3 wks)** | Validate the kernel mechanism before touching Syncthing | A C/Go prototype on 6.14+ over ext4, xfs, btrfs hydrates on `read`, `mmap` (read + write fault), `exec`, `sendfile`, `splice`, `copy_file_range`, `io_uring` read, `O_DIRECT`. Measure the first-byte latency added. Confirm listener-absent behaviour, `FAN_DENY` errno, lease-based eviction, and range semantics on overlapping events. Read HydrationAPI's conformance tests and SeaDrive's cache logic |
 | **1. Fork + hub mode** | Rename/branding and config presets | Client↔server sync of plain files with fanotify watcher on both ends; 1M-file tree scans without inotify limits |
 | **2. Virtual folder, metadata only** | Placeholders appear; nothing hydrates yet | Whole tree visible with correct `stat`; zero bytes allocated; server index never corrupted; stock Syncthing peer interop test |
 | **3. hsmd + on-demand hydration** | Open file → content appears | All Phase 0 access paths pass; block hash verification; offline → `EIO`; daemon kill → fail closed; bind-mount guard |
@@ -253,7 +252,7 @@ Read (not copy) these for design lessons:
 ## 8. Requirements and constraints
 
 - **Client kernel ≥ 6.14** for fanotify HSM mode, on ext4/xfs/btrfs. That means Fedora 42+, Ubuntu 25.04+/26.04 LTS,
-  Arch, and similar. Debian 13 (6.12) and older use the **FUSE passthrough** backend (≥ 6.9), or plain full sync.
+  Arch, and similar. Older kernels (e.g. Debian 13, 6.12) are not supported for on-demand folders.
 - `hsmd` needs `CAP_SYS_ADMIN`, because pre-content fanotify groups and mount marks aren't available unprivileged.
   Ship it as a systemd system service with a strict sandbox:
   - `CapabilityBoundingSet=CAP_SYS_ADMIN CAP_LEASE CAP_DAC_READ_SEARCH`
@@ -274,8 +273,7 @@ Read (not copy) these for design lessons:
    The design depends on these, which is why Phase 0 comes first.
 2. **Lazy directory listing.** Pre-content events cover file *content*, not `readdir`/`lookup`, so v1 materializes the
    full tree of placeholders. Huge trees cost inodes but no data blocks. Subtrees users never want remain "ignored".
-   If a lookup/readdir pre-content event lands upstream, adopt it. Otherwise the FUSE backend is the answer for
-   pathological trees.
+   If a lookup/readdir pre-content event lands upstream, adopt it.
 3. **Placeholder disk usage.** Some filesystems allocate for sparse files or inline data. Measure it (HydrationAPI found
    a bug here).
 4. **Both processes dying.** The bind-mount guard mitigates it; test it explicitly.
