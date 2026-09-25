@@ -166,6 +166,22 @@ func (f *folder) Serve(ctx context.Context) error {
 		return err // will get restarted by suture
 	}
 
+	if sr, ok := f.puller.(*sendReceiveFolder); ok && f.OnDemand {
+		// The view must be in place (and marked) before anything creates
+		// placeholders; without it the folder reports a health error and
+		// neither scans nor pulls.
+		err := f.model.hsmAddView(f.FolderConfiguration)
+		sr.od.mut.Lock()
+		sr.od.viewErr = err
+		sr.od.mut.Unlock()
+		if err != nil {
+			slog.Error("On-demand files are unavailable", f.LogAttr(), slogutil.Error(err))
+		} else {
+			defer f.model.hsmRemoveView(f.FolderConfiguration)
+			go sr.onDemandLoop(ctx)
+		}
+	}
+
 	if f.FSWatcherEnabled && f.getHealthErrorAndLoadIgnores() == nil {
 		f.startWatch(ctx)
 	}
@@ -378,6 +394,15 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 
 	if err := f.CheckPath(); err != nil {
 		return err
+	}
+
+	if sr, ok := f.puller.(*sendReceiveFolder); ok && f.OnDemand {
+		sr.od.mut.Lock()
+		err := sr.od.viewErr
+		sr.od.mut.Unlock()
+		if err != nil {
+			return fmt.Errorf("on-demand files unavailable: %w", err)
+		}
 	}
 
 	if minFree := f.model.cfg.Options().MinHomeDiskFree; minFree.Value > 0 {
@@ -698,6 +723,9 @@ func (f *folder) scanSubdirsChangedAndNew(ctx context.Context, subDirs []string,
 		ScanOwnership:         f.SendOwnership || f.SyncOwnership,
 		ScanXattrs:            f.SendXattrs || f.SyncXattrs,
 		XattrFilter:           f.XattrFilter,
+	}
+	if sr, ok := f.puller.(*sendReceiveFolder); ok && f.OnDemand {
+		scanConfig.Placeholders = placeholderChecker{sr}
 	}
 	var fchan chan scanner.ScanResult
 	if f.Type == config.FolderTypeReceiveEncrypted {

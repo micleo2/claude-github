@@ -163,6 +163,10 @@ func (c *serveCmd) monitorMain() {
 		case err = <-exit:
 		}
 
+		// If the child died without cleaning up, its on-demand views are
+		// still mounted but nothing hydrates them anymore.
+		unmountStaleOnDemandViews()
+
 		if err == nil {
 			// Successful exit indicates an intentional shutdown
 			os.Exit(svcutil.ExitSuccess.AsInt())

@@ -88,6 +88,17 @@ type FolderConfiguration struct {
 	SendXattrs              bool                        `json:"sendXattrs" xml:"sendXattrs"`
 	BlockIndexing           bool                        `json:"blockIndexing" xml:"blockIndexing" default:"true"`
 	XattrFilter             XattrFilter                 `json:"xattrFilter" xml:"xattrFilter"`
+
+	// On-demand ("online-only") files, tether extension. Only valid for
+	// send-receive folders. Path is used by the sync engine; users access
+	// the folder through OnDemandView, a bind mount where placeholders are
+	// hydrated on open.
+	OnDemand          bool     `json:"onDemand" xml:"onDemand"`
+	OnDemandView      string   `json:"onDemandView" xml:"onDemandView"`
+	PinPatterns       []string `json:"pinPatterns" xml:"pinPattern" restart:"false"`
+	CacheBudget       Size     `json:"cacheBudget" xml:"cacheBudget" default:"0" restart:"false"`
+	HydrationDenyExes []string `json:"hydrationDenyExes" xml:"hydrationDenyExe" restart:"false"`
+
 	// Legacy deprecated
 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.
 	DeprecatedMinDiskFreePct float64 `json:"-" xml:"minDiskFreePct,omitempty"` // Deprecated: Do not use.
@@ -117,6 +128,8 @@ func (f FolderConfiguration) Copy() FolderConfiguration {
 	c.Devices = make([]FolderDeviceConfiguration, len(f.Devices))
 	copy(c.Devices, f.Devices)
 	c.Versioning = f.Versioning.Copy()
+	c.PinPatterns = slices.Clone(f.PinPatterns)
+	c.HydrationDenyExes = slices.Clone(f.HydrationDenyExes)
 	return c
 }
 
@@ -322,6 +335,15 @@ func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices ma
 
 	if f.Type == FolderTypeReceiveEncrypted {
 		f.IgnorePerms = true
+	}
+
+	if f.OnDemand && f.Type != FolderTypeSendReceive {
+		slog.Warn("On-demand files are only supported for send-receive folders; disabling", "folder", f.Description(), "type", f.Type)
+		f.OnDemand = false
+	}
+	if f.OnDemand && f.OnDemandView == "" {
+		slog.Warn("On-demand folder has no view path; disabling on-demand files", "folder", f.Description())
+		f.OnDemand = false
 	}
 }
 

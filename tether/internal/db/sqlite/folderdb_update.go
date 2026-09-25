@@ -148,7 +148,8 @@ func (s *folderDB) Update(device protocol.DeviceID, fs []protocol.FileInfo, opti
 			}
 			if _, err := insertBlockListStmt.Exec(f.BlocksHash, bs); err != nil {
 				return wrap(err, "insert blocklist")
-			} else if device == protocol.LocalDeviceID && !options.SkipBlockIndex {
+			} else if device == protocol.LocalDeviceID && !options.SkipBlockIndex && !f.IsVirtual() {
+				// (Placeholders have no content to copy blocks from.)
 				// Insert all blocks
 				if err := s.insertBlocksLocked(txp, f.BlocksHash, f.Blocks); err != nil {
 					return wrap(err, "insert blocks")

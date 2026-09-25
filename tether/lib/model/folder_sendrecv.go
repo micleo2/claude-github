@@ -132,6 +132,8 @@ type sendReceiveFolder struct {
 	writeLimiter       *semaphore.Semaphore
 
 	tempPullErrors map[string]string // pull errors that might be just transient
+
+	od *onDemandState // on-demand files (tether)
 }
 
 func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.FolderConfiguration, ver versioner.Versioner, evLogger events.Logger, ioLimiter *semaphore.Semaphore) service {
@@ -140,6 +142,7 @@ func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.Fold
 		queue:              newJobQueue(),
 		blockPullReorderer: newBlockPullReorderer(cfg.BlockPullOrder, model.id, cfg.DeviceIDs()),
 		writeLimiter:       semaphore.New(cfg.MaxConcurrentWrites),
+		od:                 newOnDemandState(),
 	}
 	f.puller = f
 
@@ -393,6 +396,10 @@ loop:
 				// We are supposed to copy the entire file, and then fetch nothing. We
 				// are only updating metadata, so we don't actually *need* to make the
 				// copy.
+				if curFile.IsVirtual() {
+					// Still a placeholder after the metadata update.
+					file.LocalFlags |= protocol.FlagLocalVirtual
+				}
 				f.shortcutFile(file, dbUpdateChan)
 			} else {
 				// Queue files for processing after directories and symlinks.
@@ -487,6 +494,13 @@ nextFile:
 
 			f.queue.Done(fileName)
 			continue nextFile
+		}
+
+		// On-demand folders only write placeholders for unpinned files;
+		// content is fetched when the file is opened.
+		if f.OnDemand && !f.isPinned(fi.Name) {
+			f.handleVirtualFile(fi, dbUpdateChan, scanChan)
+			continue
 		}
 
 		// Verify there is some availability for the file before we start
@@ -998,6 +1012,13 @@ func (f *sendReceiveFolder) renameFile(cur, source, target protocol.FileInfo, db
 	}()
 
 	f.sl.Debug("Taking rename shortcut", "from", source.Name, "to", target.Name)
+
+	if cur.IsVirtual() {
+		// The source has no content on disk; copying or archiving it would
+		// produce a file of zeros. Let the target be handled normally.
+		err = errors.New("source is a placeholder")
+		return err
+	}
 
 	// Check that source is compatible with what we have in the DB
 	if err = f.checkToBeDeleted(source, cur, true, scanChan); err != nil {
@@ -1683,7 +1704,7 @@ func (f *sendReceiveFolder) performFinish(file, curFile protocol.FileInfo, hasCu
 			return fmt.Errorf("checking existing file: %w", err)
 		}
 
-		if !curFile.IsDirectory() && !curFile.IsSymlink() && file.InConflictWith(curFile) {
+		if !curFile.IsDirectory() && !curFile.IsSymlink() && !curFile.IsVirtual() && file.InConflictWith(curFile) {
 			// The new file has been changed in conflict with the existing one. We
 			// should file it away as a conflict instead of just removing or
 			// archiving.
@@ -1960,6 +1981,10 @@ func (f *sendReceiveFolder) deleteItemOnDisk(item protocol.FileInfo, scanChan ch
 		// Directories aren't archived and need special treatment due
 		// to potential children.
 		return f.deleteDirOnDisk(item.Name, scanChan)
+
+	case item.IsVirtual():
+		// A placeholder holds no content worth archiving.
+		return f.inWritableDir(f.mtimefs.Remove, item.Name)
 
 	case !item.IsSymlink() && f.versioner != nil:
 		// If we should use versioning, let the versioner archive the

@@ -12,6 +12,8 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"syscall"
 
@@ -33,6 +35,9 @@ func (f *BasicFilesystem) GetXattr(path string, xattrFilter XattrFilter) ([]prot
 	res := make([]protocol.Xattr, 0, len(attrs))
 	var totSize int
 	for _, attr := range attrs {
+		if strings.HasPrefix(attr, localXattrPrefix) {
+			continue
+		}
 		if !xattrFilter.Permit(attr) {
 			l.Debugf("get xattr %s: skipping attribute %q denied by filter", path, attr)
 			continue
@@ -111,7 +116,15 @@ func getXattr(path, name string) ([]byte, error) {
 	return val, nil
 }
 
+// localXattrPrefix marks attributes that are local bookkeeping (on-demand
+// placeholder state) and are never read for syncing, set or removed.
+const localXattrPrefix = "user.tether."
+
 func (f *BasicFilesystem) SetXattr(path string, xattrs []protocol.Xattr, xattrFilter XattrFilter) error {
+	xattrs = slices.DeleteFunc(slices.Clone(xattrs), func(xa protocol.Xattr) bool {
+		return strings.HasPrefix(xa.Name, localXattrPrefix)
+	})
+
 	// Index the new attribute set.
 	xattrsIdx := make(map[string]int)
 	for i, xa := range xattrs {

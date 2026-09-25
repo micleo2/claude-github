@@ -31,6 +31,12 @@ const (
 	FlagLocalGlobal        FlagLocal = 1 << 4 // 16: This is the global file version
 	FlagLocalNeeded        FlagLocal = 1 << 5 // 32: We need this file
 	FlagLocalRemoteInvalid FlagLocal = 1 << 6 // 64: The remote marked this as invalid
+	// FlagLocalVirtual marks an on-demand placeholder: metadata and block
+	// list are current, but the content is not on disk. It is deliberately
+	// not an invalid flag: the file is announced normally so that local
+	// metadata changes and renames of placeholders propagate. Requests for
+	// its blocks are refused, so peers fetch them elsewhere.
+	FlagLocalVirtual FlagLocal = 1 << 7 // 128
 
 	// Flags that should result in the Invalid bit on outgoing updates (or had it on ingoing ones)
 	LocalInvalidFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalRemoteInvalid
@@ -40,7 +46,7 @@ const (
 	// disk.
 	LocalConflictFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalReceiveOnly
 
-	LocalAllFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalGlobal | FlagLocalNeeded | FlagLocalRemoteInvalid
+	LocalAllFlags = FlagLocalUnsupported | FlagLocalIgnored | FlagLocalMustRescan | FlagLocalReceiveOnly | FlagLocalGlobal | FlagLocalNeeded | FlagLocalRemoteInvalid | FlagLocalVirtual
 )
 
 // localFlagBitNames maps flag values to characters which can be used to
@@ -53,6 +59,7 @@ var localFlagBitNames = map[FlagLocal]string{
 	FlagLocalGlobal:        "G",
 	FlagLocalNeeded:        "n",
 	FlagLocalRemoteInvalid: "v",
+	FlagLocalVirtual:       "p",
 }
 
 func (f FlagLocal) IsInvalid() bool {
@@ -365,6 +372,12 @@ func (f FileInfo) IsIgnored() bool {
 
 func (f FileInfo) MustRescan() bool {
 	return f.LocalFlags&FlagLocalMustRescan != 0
+}
+
+// IsVirtual reports whether the file is an on-demand placeholder: its
+// metadata and block list are current but the content is not on disk.
+func (f FileInfo) IsVirtual() bool {
+	return f.LocalFlags&FlagLocalVirtual != 0
 }
 
 func (f FileInfo) IsReceiveOnlyChanged() bool {

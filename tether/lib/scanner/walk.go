@@ -7,6 +7,7 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -67,6 +68,17 @@ type Config struct {
 	ScanXattrs bool
 	// Filter for extended attributes
 	XattrFilter XattrFilter
+	// If Placeholders is not nil, files it identifies as on-demand
+	// placeholders are never read or hashed.
+	Placeholders PlaceholderChecker
+}
+
+type PlaceholderChecker interface {
+	// Placeholder reports whether the file at name is an on-demand
+	// placeholder and, if the index still knows the content it stands for,
+	// returns that file (with blocks). ok is false for placeholders whose
+	// content is unknown; those are left alone.
+	Placeholder(name string) (source protocol.FileInfo, isPlaceholder, ok bool)
 }
 
 type CurrentFiler interface {
@@ -434,7 +446,7 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, 
 		return w.walkDir(ctx, path, info, finishedChan)
 
 	case info.IsRegular():
-		return w.walkRegular(ctx, path, info, toHashChan)
+		return w.walkRegular(ctx, path, info, toHashChan, finishedChan)
 
 	default:
 		// A special file, socket, fifo, etc. -- do nothing, just skip and continue scanning.
@@ -443,7 +455,7 @@ func (w *walker) handleItem(ctx context.Context, path string, info fs.FileInfo, 
 	}
 }
 
-func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo) error {
+func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileInfo, toHashChan chan<- protocol.FileInfo, finishedChan chan<- ScanResult) error {
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
 	blockSize := protocol.BlockSize(info.Size())
@@ -472,6 +484,12 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 	l.Debugln(w, "checking:", f)
 
 	f.New = !hasCurFile
+
+	if w.Placeholders != nil {
+		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		}
+	}
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
@@ -509,6 +527,52 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 	return nil
 }
 
+// walkPlaceholder handles an on-demand placeholder. Its content is not on
+// disk, so it is never hashed: the block list comes from the index entry of
+// the file it was created for (which may have had a different name, if the
+// placeholder was moved).
+func (w *walker) walkPlaceholder(ctx context.Context, f, curFile protocol.FileInfo, hasCurFile bool, src protocol.FileInfo, ok bool, finishedChan chan<- ScanResult) error {
+	if !ok || src.Size != f.Size {
+		l.Debugln(w, "leaving unknown placeholder alone:", f.Name)
+		return nil
+	}
+
+	if hasCurFile && !curFile.IsDeleted() && bytes.Equal(curFile.BlocksHash, src.BlocksHash) &&
+		curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
+			ModTimeWindow:   w.ModTimeWindow,
+			IgnorePerms:     w.IgnorePerms,
+			IgnoreBlocks:    true,
+			IgnoreFlags:     protocol.LocalAllFlags,
+			IgnoreOwnership: !w.ScanOwnership,
+			IgnoreXattrs:    !w.ScanXattrs,
+		}) {
+		if curFile.IsVirtual() {
+			l.Debugln(w, "unchanged placeholder:", curFile)
+			return nil
+		}
+		// The index claims content that is no longer on disk (e.g. an
+		// interrupted eviction). Record that without creating a new
+		// version.
+		curFile.LocalFlags |= protocol.FlagLocalVirtual
+		f = curFile
+	} else {
+		// Metadata change or move of a placeholder: a new version with
+		// the same content.
+		f.Blocks = src.Blocks
+		f.BlocksHash = src.BlocksHash
+		f.RawBlockSize = src.RawBlockSize
+		f.LocalFlags |= protocol.FlagLocalVirtual
+	}
+
+	l.Debugln(w, "placeholder:", f)
+	select {
+	case finishedChan <- ScanResult{File: f}:
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+	return nil
+}
+
 func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, finishedChan chan<- ScanResult) error {
 	curFile, hasCurFile := w.CurrentFiler.CurrentFile(relPath)
 
@@ -521,6 +585,12 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 	l.Debugln(w, "checking:", f)
 
 	f.New = !hasCurFile
+
+	if w.Placeholders != nil {
+		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		}
+	}
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
@@ -575,6 +645,12 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
 	l.Debugln(w, "checking:", f)
 
 	f.New = !hasCurFile
+
+	if w.Placeholders != nil {
+		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		}
+	}
 
 	if hasCurFile {
 		if curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{

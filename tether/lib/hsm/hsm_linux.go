@@ -32,6 +32,7 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"golang.org/x/sys/unix"
@@ -42,6 +43,14 @@ const (
 	// the sync database is authoritative.
 	XattrState   = "user.tether.state"
 	StateVirtual = "virtual"
+	// XattrOrigin and XattrBlocksHash record which file (name, block list
+	// hash) a placeholder stands for, so that a moved placeholder can be
+	// identified without reading it.
+	XattrOrigin     = "user.tether.origin"
+	XattrBlocksHash = "user.tether.bh"
+	// XattrPrefix covers all of the above. These attributes are local
+	// bookkeeping and must never be synced.
+	XattrPrefix = "user.tether."
 
 	eventMask  = unix.FAN_OPEN_PERM | unix.FAN_PRE_ACCESS
 	ignoreMask = eventMask
@@ -49,15 +58,17 @@ const (
 
 // Handler supplies file content.
 type Handler interface {
-	// Hydrate writes the complete content of the file at name (relative to
-	// the view's folder) into f and returns nil, or returns an error whose
-	// errno (if any) is reported to the blocked application.
+	// Hydrate writes the complete content of the placeholder at name
+	// (relative to the view's folder) into f, then calls Finish(f), and
+	// returns nil. Otherwise it returns an error whose errno (if any) is
+	// reported to the blocked application.
 	Hydrate(ctx context.Context, folder, name string, f *os.File) error
 }
 
-// Policy decides whether a process may trigger hydration. Returning a
-// non-zero errno denies the access with that errno.
-type Policy func(pid int, exe string) unix.Errno
+// Policy decides whether a process may trigger hydration of a file in the
+// given folder. Returning a non-zero errno denies the access with that
+// errno.
+type Policy func(folder string, pid int, exe string) unix.Errno
 
 // View is a marked bind mount of a folder.
 type View struct {
@@ -279,7 +290,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 	}
 	if l.policy != nil {
 		exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
-		if errno := l.policy(pid, exe); errno != 0 {
+		if errno := l.policy(v.Folder, pid, exe); errno != 0 {
 			l.log.Debug("Hydration denied by policy", "folder", v.Folder, "file", name, "pid", pid, "exe", exe)
 			return errno
 		}
@@ -289,7 +300,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 	if err := unix.Fstat(fd, &st); err != nil {
 		return unix.EIO
 	}
-	gen, _ := unix.IoctlGetInt(fd, fsIocGetVersion)
+	gen, _ := unix.IoctlGetInt(fd, fsIocGetVersion) //nolint:gosec
 	key := fileKey{dev: st.Dev, ino: st.Ino, gen: gen}
 
 	// Concurrent accesses to the same file share one hydration.
@@ -298,7 +309,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		fl = prev.(*flight)
 		<-fl.done
 	} else {
-		fl.err = l.hydrate(ctx, v, name, f, &st)
+		fl.err = l.hydrate(ctx, v, name, f)
 		l.flights.Delete(key)
 		close(fl.done)
 	}
@@ -314,20 +325,15 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 	return 0
 }
 
-func (l *Listener) hydrate(ctx context.Context, v *View, name string, f *os.File, st *unix.Stat_t) error {
+func (l *Listener) hydrate(ctx context.Context, v *View, name string, f *os.File) error {
 	if !IsVirtual(f) { // lost a race with another flight
 		return nil
 	}
 	if err := l.handler.Hydrate(ctx, v.Folder, name, f); err != nil {
 		return err
 	}
-	// Writing through the event fd bumped mtime; keep the placeholder's.
-	ts := []unix.Timespec{st.Atim, st.Mtim}
-	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", f.Fd()), ts, 0); err != nil {
-		return err
-	}
-	if err := unix.Fremovexattr(int(f.Fd()), XattrState); err != nil && !errors.Is(err, unix.ENODATA) {
-		return err
+	if IsVirtual(f) {
+		return fmt.Errorf("handler did not finish hydration: %w", unix.EIO)
 	}
 	return nil
 }
@@ -354,17 +360,76 @@ func IsVirtual(f *os.File) bool {
 	return err == nil && string(b[:n]) == StateVirtual
 }
 
+// ReadPlaceholder inspects the file at path (not following symlinks). It
+// reports whether it is a placeholder and, if recorded, which file it
+// stands for.
+func ReadPlaceholder(path string) (origin string, blocksHash []byte, isPlaceholder bool) {
+	var b [16]byte
+	n, err := unix.Lgetxattr(path, XattrState, b[:])
+	if err != nil || string(b[:n]) != StateVirtual {
+		return "", nil, false
+	}
+	buf := make([]byte, 4096)
+	if n, err := unix.Lgetxattr(path, XattrOrigin, buf); err == nil {
+		origin = string(buf[:n])
+	}
+	if n, err := unix.Lgetxattr(path, XattrBlocksHash, buf); err == nil {
+		blocksHash = append([]byte(nil), buf[:n]...)
+	}
+	return origin, blocksHash, true
+}
+
+// ReadPlaceholderFile is ReadPlaceholder for an open file.
+func ReadPlaceholderFile(f *os.File) (origin string, blocksHash []byte, isPlaceholder bool) {
+	fd := int(f.Fd())
+	var b [16]byte
+	n, err := unix.Fgetxattr(fd, XattrState, b[:])
+	if err != nil || string(b[:n]) != StateVirtual {
+		return "", nil, false
+	}
+	buf := make([]byte, 4096)
+	if n, err := unix.Fgetxattr(fd, XattrOrigin, buf); err == nil {
+		origin = string(buf[:n])
+	}
+	if n, err := unix.Fgetxattr(fd, XattrBlocksHash, buf); err == nil {
+		blocksHash = append([]byte(nil), buf[:n]...)
+	}
+	return origin, blocksHash, true
+}
+
+// Finish completes a hydration: the placeholder attributes are removed and
+// the modification time is reset to mtime (writing the content bumped it).
+func Finish(f *os.File, mtime time.Time) error {
+	fd := int(f.Fd())
+	ts := []unix.Timespec{unix.NsecToTimespec(time.Now().UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
+		return err
+	}
+	for _, name := range []string{XattrOrigin, XattrBlocksHash, XattrState} {
+		if err := unix.Fremovexattr(fd, name); err != nil && !errors.Is(err, unix.ENODATA) {
+			return err
+		}
+	}
+	return nil
+}
+
 // MarkVirtual turns an open file into a placeholder of the given size:
-// content is discarded (the blocks are freed) and the xattr set. The caller
-// must ensure nobody else has the file open (see Lease). The file's mtime is
-// preserved.
-func MarkVirtual(f *os.File, size int64) error {
+// content is discarded (the blocks are freed) and the xattrs set. origin and
+// blocksHash identify the content it stands for. The caller must ensure
+// nobody else has the file open (see Lease). The file's mtime is preserved.
+func MarkVirtual(f *os.File, size int64, origin string, blocksHash []byte) error {
 	fd := int(f.Fd())
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return err
 	}
 	if err := unix.Fsetxattr(fd, XattrState, []byte(StateVirtual), 0); err != nil {
+		return err
+	}
+	if err := unix.Fsetxattr(fd, XattrOrigin, []byte(origin), 0); err != nil {
+		return err
+	}
+	if err := unix.Fsetxattr(fd, XattrBlocksHash, blocksHash, 0); err != nil {
 		return err
 	}
 	// Truncating to zero frees every block, including a partial last one

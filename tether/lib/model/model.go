@@ -177,6 +177,9 @@ type model struct {
 	remoteFolderStates             map[protocol.DeviceID]map[string]remoteFolderState // deviceID -> folders
 	indexHandlers                  *serviceMap[protocol.DeviceID, *indexHandlerRegistry]
 
+	// on-demand files (tether), concurrency safe
+	od *modelOnDemand
+
 	// for testing only
 	foldersRunning atomic.Int32
 }
@@ -252,6 +255,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 		deviceDownloads:                make(map[protocol.DeviceID]*deviceDownloadState),
 		remoteFolderStates:             make(map[protocol.DeviceID]map[string]remoteFolderState),
 		indexHandlers:                  newServiceMap[protocol.DeviceID, *indexHandlerRegistry](evLogger),
+		od:                             &modelOnDemand{views: make(map[string]string)},
 	}
 	for devID, cfg := range cfg.Devices() {
 		m.deviceStatRefs[devID] = stats.NewDeviceStatisticsReference(db.NewTyped(sdb, "devicestats/"+devID.String()))
@@ -267,6 +271,7 @@ func NewModel(cfg config.Wrapper, id protocol.DeviceID, sdb db.DB, protectedFile
 
 func (m *model) serve(ctx context.Context) error {
 	defer m.closeAllConnectionsAndWait()
+	defer m.hsmClose()
 
 	cfg := m.cfg.Subscribe(m)
 	defer m.cfg.Unsubscribe(m)
@@ -2008,6 +2013,15 @@ func (m *model) Request(conn protocol.Connection, req *protocol.Request) (out pr
 	if folderIgnores.Match(req.Name).IsIgnored() {
 		l.Debugf("%v REQ(in) for ignored file: %s: %q / %q o=%d s=%d", m, deviceID.Short(), req.Folder, req.Name, req.Offset, req.Size)
 		return nil, protocol.ErrInvalid
+	}
+
+	if folderCfg.OnDemand {
+		// Placeholders are announced like normal files but have no content
+		// to serve; the requester moves on to another device.
+		if cf, ok, err := m.sdb.GetDeviceFile(req.Folder, protocol.LocalDeviceID, req.Name); err == nil && ok && cf.IsVirtual() {
+			l.Debugf("%v REQ(in) for placeholder: %s: %q / %q o=%d s=%d", m, deviceID.Short(), req.Folder, req.Name, req.Offset, req.Size)
+			return nil, protocol.ErrNoSuchFile
+		}
 	}
 
 	// Restrict parallel requests by connection/device

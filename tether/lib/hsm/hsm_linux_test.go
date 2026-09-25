@@ -38,8 +38,10 @@ func (h *mapHandler) Hydrate(_ context.Context, folder, name string, f *os.File)
 	if !ok {
 		return unix.ENOENT
 	}
-	_, err := f.WriteAt(d, 0)
-	return err
+	if _, err := f.WriteAt(d, 0); err != nil {
+		return err
+	}
+	return Finish(f, time.Unix(1700000000, 0))
 }
 
 func setup(t *testing.T, h Handler, p Policy) (lower, view string, l *Listener) {
@@ -74,7 +76,7 @@ func placeholder(t *testing.T, path string, size int64) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	if err := MarkVirtual(f, size); err != nil {
+	if err := MarkVirtual(f, size, filepath.Base(path), []byte("bh")); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -98,10 +100,35 @@ func TestHydrateOnOpen(t *testing.T) {
 	if IsVirtual(f) {
 		t.Fatal("still virtual after hydration")
 	}
+	if _, _, ph := ReadPlaceholder(filepath.Join(lower, "dir/a")); ph {
+		t.Fatal("placeholder xattrs left behind")
+	}
+	if st, _ := f.Stat(); st.ModTime().Unix() != 1700000000 {
+		t.Fatal("mtime not restored")
+	}
 	// Second read is served from disk.
 	os.ReadFile(filepath.Join(view, "dir/a"))
 	if n := h.calls.Load(); n != 1 {
 		t.Fatalf("handler called %d times", n)
+	}
+}
+
+func TestReadPlaceholder(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root for user xattrs on some filesystems")
+	}
+	p := filepath.Join(t.TempDir(), "ph")
+	f, _ := os.Create(p)
+	defer f.Close()
+	if err := MarkVirtual(f, 123, "orig/name", []byte{1, 2, 3}); err != nil {
+		t.Skip(err)
+	}
+	origin, bh, ok := ReadPlaceholder(p)
+	if !ok || origin != "orig/name" || !bytes.Equal(bh, []byte{1, 2, 3}) {
+		t.Fatalf("got %q %v %v", origin, bh, ok)
+	}
+	if st, _ := f.Stat(); st.Size() != 123 {
+		t.Fatal("size")
 	}
 }
 
@@ -154,7 +181,7 @@ func TestErrnoPropagates(t *testing.T) {
 
 func TestPolicyDenies(t *testing.T) {
 	h := &mapHandler{data: map[string][]byte{"f/x": []byte("hi")}}
-	lower, view, _ := setup(t, h, func(pid int, exe string) unix.Errno {
+	lower, view, _ := setup(t, h, func(folder string, pid int, exe string) unix.Errno {
 		if filepath.Base(exe) == "cat" {
 			return unix.EAGAIN
 		}
@@ -186,7 +213,7 @@ func TestEvictAndRehydrate(t *testing.T) {
 	if err := Lease(f); err != nil {
 		t.Fatal(err)
 	}
-	if err := MarkVirtual(f, int64(len(content))); err != nil {
+	if err := MarkVirtual(f, int64(len(content)), "r", []byte("bh")); err != nil {
 		t.Fatal(err)
 	}
 	if err := l.Forget(f); err != nil {
@@ -197,7 +224,9 @@ func TestEvictAndRehydrate(t *testing.T) {
 
 	var st unix.Stat_t
 	unix.Stat(filepath.Join(lower, "r"), &st)
-	if st.Blocks != 0 {
+	// Data blocks are gone; at most one filesystem block may hold the
+	// placeholder xattrs when they do not fit inside the inode.
+	if st.Blocks*512 > 4096 {
 		t.Fatalf("evicted file still has %d blocks", st.Blocks)
 	}
 	if got, _ := os.ReadFile(filepath.Join(view, "r")); !bytes.Equal(got, content) {

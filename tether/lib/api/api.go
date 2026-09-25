@@ -285,6 +285,13 @@ func (s *service) Serve(ctx context.Context) error {
 	restMux.HandlerFunc(http.MethodGet, "/rest/system/log", s.getSystemLog)                   // [since]
 	restMux.HandlerFunc(http.MethodGet, "/rest/system/log.txt", s.getSystemLogTxt)            // [since]
 
+	// On-demand files (tether)
+	restMux.HandlerFunc(http.MethodGet, "/rest/ondemand/status", s.getOnDemandStatus) // folder [prefix]
+	restMux.HandlerFunc(http.MethodPost, "/rest/ondemand/pin", s.postOnDemand)        // folder path
+	restMux.HandlerFunc(http.MethodPost, "/rest/ondemand/unpin", s.postOnDemand)      // folder path
+	restMux.HandlerFunc(http.MethodPost, "/rest/ondemand/evict", s.postOnDemand)      // folder path
+	restMux.HandlerFunc(http.MethodPost, "/rest/ondemand/hydrate", s.postOnDemand)    // folder path
+
 	// The POST handlers
 	restMux.HandlerFunc(http.MethodPost, "/rest/db/prio", s.postDBPrio)                          // folder file
 	restMux.HandlerFunc(http.MethodPost, "/rest/db/ignores", s.postDBIgnores)                    // folder
