@@ -133,6 +133,27 @@ func (q *prefetchQueue) dropLane(lane int) {
 	}
 }
 
+// filterLane drops the queued files of a lane that keep rejects, and
+// returns them.
+func (q *prefetchQueue) filterLane(lane int, keep func(string) bool) []string {
+	q.mut.Lock()
+	defer q.mut.Unlock()
+	var dropped []string
+	names := q.lanes[lane][:0]
+	for _, name := range q.lanes[lane] {
+		if keep(name) {
+			names = append(names, name)
+		} else {
+			delete(q.queued, name)
+			dropped = append(dropped, name)
+		}
+	}
+	if _, ok := q.lanes[lane]; ok {
+		q.lanes[lane] = names
+	}
+	return dropped
+}
+
 // pop returns the next file to prefetch and the lane it came from.
 func (q *prefetchQueue) pop() (string, int, bool) {
 	q.mut.Lock()

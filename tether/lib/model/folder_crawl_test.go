@@ -7,6 +7,7 @@
 package model
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
@@ -87,37 +88,37 @@ func TestTreeWalker(t *testing.T) {
 
 	all := findOrder(t, base, "")
 	all = slices.DeleteFunc(all, func(s string) bool { return s == ".stfolder/marker" || s == "link" })
-	if got := drain(newTreeWalker(base, "", "")); !slices.Equal(got, all) {
+	if got := drain(newTreeWalker(base, "", "", false)); !slices.Equal(got, all) {
 		t.Fatalf("whole tree:\n got %v\nwant %v", got, all)
 	}
 
 	// Starting after each file continues exactly where find would.
 	for i, after := range all {
-		if got := drain(newTreeWalker(base, "", after)); !slices.Equal(got, all[i+1:]) {
+		if got := drain(newTreeWalker(base, "", after, false)); !slices.Equal(got, all[i+1:]) {
 			t.Errorf("after %s:\n got %v\nwant %v", after, got, all[i+1:])
 		}
 	}
 
 	// Under a root, only its files.
 	sub := findOrder(t, base, "a")
-	if got := drain(newTreeWalker(base, "a", "")); !slices.Equal(got, sub) {
+	if got := drain(newTreeWalker(base, "a", "", false)); !slices.Equal(got, sub) {
 		t.Errorf("root a:\n got %v\nwant %v", got, sub)
 	}
-	if got := drain(newTreeWalker(base, "a", "b/1")); !slices.Equal(got, sub) {
+	if got := drain(newTreeWalker(base, "a", "b/1", false)); !slices.Equal(got, sub) {
 		t.Errorf("start outside root: got %v, want %v", got, sub)
 	}
 
 	// A start file that no longer exists starts its directory over.
-	if got := drain(newTreeWalker(base, "b", "b/gone")); !slices.Equal(got, findOrder(t, base, "b")) {
+	if got := drain(newTreeWalker(base, "b", "b/gone", false)); !slices.Equal(got, findOrder(t, base, "b")) {
 		t.Errorf("vanished start: got %v", got)
 	}
 
 	// position reports the last file handed out.
-	w := newTreeWalker(base, "", "")
+	w := newTreeWalker(base, "", "", false)
 	for range 3 {
 		w.next()
 	}
-	if got := drain(newTreeWalker(base, "", w.position())); !slices.Equal(got, drain(w)) {
+	if got := drain(newTreeWalker(base, "", w.position(), false)); !slices.Equal(got, drain(w)) {
 		t.Errorf("position does not resume the walk")
 	}
 }
@@ -159,5 +160,85 @@ func TestPrefetchQueueLanes(t *testing.T) {
 	// A dropped lane's names can be queued again.
 	if n := q.pushLane(9, []string{"x"}); n != 1 {
 		t.Fatal("dropped names stay deduplicated")
+	}
+}
+
+func TestTreeWalkerSortedAndExplains(t *testing.T) {
+	base := t.TempDir()
+	// Created in an order that differs from sorted order.
+	for _, name := range []string{"c/2", "a/9", "b/1", "a/1", "c/1", "b/x/1"} {
+		p := filepath.Join(base, name)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, nil, 0o644)
+	}
+	var got []string
+	w := newTreeWalker(base, "", "", true)
+	for {
+		n, ok := w.next()
+		if !ok {
+			break
+		}
+		got = append(got, n)
+	}
+	want := []string{"a/1", "a/9", "b/1", "b/x/1", "c/1", "c/2"}
+	if !slices.Equal(got, want) {
+		t.Fatalf("sorted walk: got %v, want %v", got, want)
+	}
+	if !explains(base, "", "a/9", "b/x/1", orderSorted) {
+		t.Error("sorted order should explain a/9 -> b/x/1")
+	}
+	if explains(base, "", "b/x/1", "a/1", orderSorted) {
+		t.Error("going backwards is not explained")
+	}
+	if explains(base, "", "", "a/1", orderSorted) || explains(base, "", "a/1", "a/9", orderSweep) {
+		t.Error("nothing is explained without a position or an order")
+	}
+}
+
+func TestCrawlLaneExclusions(t *testing.T) {
+	l := &crawlLane{root: "src", skipped: map[string]int{}, used: map[string]int{}}
+	for i := range crawlExcludeAfter {
+		l.note(l.skipped, fmt.Sprintf("src/d%d/f.txt", i))
+		l.note(l.skipped, fmt.Sprintf("src/.git/objects/%02d/x", i))
+		l.note(l.used, fmt.Sprintf("src/d%d/f.c", i))
+	}
+	for name, want := range map[string]bool{
+		"src/other/a.txt":       true,  // extension passed by
+		"src/.git/HEAD":         true,  // directory passed by
+		"src/d3/b.c":            false, // opened extension
+		"src/d3/Makefile":       true,  // no extension, like the .git objects
+		"src/sub/objects/1/y.c": true,  // "objects" passed by everywhere
+	} {
+		if got := l.excluded(name); got != want {
+			t.Errorf("excluded(%s) = %v, want %v", name, got, want)
+		}
+	}
+	// Opening one lifts the exclusion.
+	l.note(l.used, "src/x/y.txt")
+	if l.excluded("src/other/a.txt") {
+		t.Error("an extension the walker opened stays excluded")
+	}
+}
+
+func TestPrefetchQueueFilterLane(t *testing.T) {
+	q := newPrefetchQueue()
+	q.pushLane(3, []string{"a.c", "b.txt", "c.c", "d.txt"})
+	dropped := q.filterLane(3, func(n string) bool { return filepath.Ext(n) == ".c" })
+	if !slices.Equal(dropped, []string{"b.txt", "d.txt"}) {
+		t.Fatalf("dropped %v", dropped)
+	}
+	var got []string
+	for {
+		n, _, ok := q.pop()
+		if !ok {
+			break
+		}
+		got = append(got, n)
+	}
+	if !slices.Equal(got, []string{"a.c", "c.c"}) {
+		t.Fatalf("left %v", got)
+	}
+	if q.pushLane(3, []string{"b.txt"}) != 1 {
+		t.Fatal("a dropped file stays marked as queued")
 	}
 }

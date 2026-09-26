@@ -15,6 +15,8 @@ program reads a normal local file at native speed.
 - **Design and rationale:** [PLAN.md](PLAN.md)
 - **Kernel-level findings (Phase 0):** [spikes/fanotify-hsm/FINDINGS.md](spikes/fanotify-hsm/FINDINGS.md)
 - **Small-file performance survey:** [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md)
+- **Prefetching for sorted, parallel and filtering walkers (survey, measurements):**
+  [docs/research/walker-prefetch.md](docs/research/walker-prefetch.md)
 - **Placeholders seen from other mount namespaces (survey, spikes, options):**
   [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md)
 - **Eviction (survey and measurements):** [docs/research/eviction.md](docs/research/eviction.md)
@@ -107,12 +109,21 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
   in the order the filesystem lists directories, which is the order `find` and `grep -r` use.
   - **Tracking the walker:** files fetched for it stay marked until their first open, which tells tether how far it
     has got.
+  - **Other walkers:** sorted walkers (`rg --sort path`, `git status`) are recognised by their mispredictions.
+    Parallel ones (`rg`, `make -j`) get their whole subtree swept. Extensions and directory names a filtering walker
+    skips (`grep --include`, `.git`) are learned.
   - **Limits:** files ≤ `crawlPrefetchMaxFileKiB` (default 1024; 0 disables), an adaptive window of 16–1024 files
     ahead, at most 256 MiB (or a tenth of the cache budget) downloaded and not yet opened, `crawlPrefetchMaxMiB`
-    (default 1024) per walk.
+    (default 1024) per walk. A sweep pauses while fewer than 1 in 10 fetched files are used.
   - **Never triggered by** `find`, `du`, `ls -R` or indexers, which don't open file content or are denied.
-  - **Effect:** `grep -r` over 600 directories with one file each, 20 ms RTT: 17.4 s → 1.1 s. See
-    [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md).
+  - **Effect** over 600 directories with one file each, 20 ms RTT:
+    - `grep -r`: 17.4 s → 1.1 s
+    - `rg`: 7.7 s → 1.1 s
+    - `rg --sort path`: 17.7 s → 1.3 s
+    - `git status`: 12.9 s → 1.4 s
+
+    See [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md) and
+    [docs/research/walker-prefetch.md](docs/research/walker-prefetch.md).
 - **Cache budget:** when local content exceeds the budget, the least recently used unpinned files are evicted down
   to 80% of the budget, so a folder near its budget isn't cleaned in many small rounds. Prefetched files that nobody
   opened are evicted first.
@@ -135,7 +146,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 49 end-to-end tests, ~7 min
+sudo e2e/run.sh                          # 50 end-to-end tests, ~9 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -194,10 +205,8 @@ host's network). Both fail identically on unmodified upstream in this environmen
   durable in the background; see [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md) §4.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
-- **Prefetch is tuned for sequential walkers.** Ahead-of-walk prediction follows directory order, which is what
-  `find` and `grep -r` use. Multi-threaded walkers (`rg`, `git status`) and filtering ones (`grep -r --include`) are not
-  measured yet; a filtering walker may cost up to `crawlPrefetchMaxMiB` of files it never opens. Interactive opens and
-  the first few files of a walk still wait one fetch each.
+- **The first files of a walk wait.** A walk is recognised after its first 4 directories, which are fetched on demand,
+  as are interactive opens. A filtering walker costs a window of speculative files before its filter is learned.
 - **A metadata-only change to a placeholder can win a conflict against a content change.** This needs the content
   change to carry an *older* mtime. The winning version's content then exists nowhere. The losing content is kept as a
   conflict copy, and the file cannot be hydrated until someone writes it again.

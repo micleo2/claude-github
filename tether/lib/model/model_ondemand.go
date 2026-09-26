@@ -120,7 +120,7 @@ func (h hsmHandler) Hydrate(ctx context.Context, folder, name string, f *os.File
 		return err
 	}
 	if pid, ok := hsm.Accessor(ctx); ok {
-		sr.crawlTouch(pid, name, sr.isComplete(f))
+		defer sr.crawlTouch(pid, name, sr.isComplete(f))()
 	}
 	return sr.hydrate(ctx, name, f, hydrateDemand)
 }

@@ -1,7 +1,8 @@
 # Design: crawler-aware prefetch
 
 Status: **implemented** (`tether/lib/model/folder_crawl.go`), except for the guardrails listed under
-[Not implemented](#not-implemented). Builds on sibling prefetch (`tether/lib/model/folder_prefetch.go`) and the survey
+[Not implemented](#not-implemented). Sorted, parallel and filtering walkers, with their prior art and measurements, are
+covered in [docs/research/walker-prefetch.md](../research/walker-prefetch.md). Builds on sibling prefetch (`tether/lib/model/folder_prefetch.go`) and the survey
 in [`docs/research/small-file-hydration.md`](../research/small-file-hydration.md).
 
 ## Problem
@@ -22,6 +23,15 @@ Goal: recognise a process that is walking the tree, and fetch ahead of it.
 | 120 directories | 20 ms RTT | 3.9 s | 1.1 s | 3.7× (e2e `crawl_prefetch_under_latency`) |
 | 600 directories | 20 ms RTT | 17.4 s | 1.1 s | 15× (2.4 s with 16 prefetch workers) |
 | 600 directories | LAN (Docker bridge) | 2.0 s | 0.53 s | 3.8× |
+
+Other walkers (600 files, 20 ms RTT; details in the research note):
+
+| Walker | Off | On |
+|---|---|---|
+| `rg` (threads) | 7.7 s | 1.1 s |
+| `rg --sort path` | 17.7 s | 1.3 s |
+| `git status` (cold, 400 files) | 12.9 s | 1.4 s |
+| `grep -r --include=*.c` | 5.8 s | 0.9 s; 27 of the 450 files it skips were fetched |
 
 The prediction was exact for GNU grep over 600 files: it opened 4 cold before being recognised, and every one of the
 other 596 had been predicted (no mispredictions). With 16 workers the 20 ms case was bound by concurrency
@@ -65,19 +75,36 @@ An actor is a **walker** when it opens placeholders in at least **4 directories 
 ## 4. Prediction
 
 - **Follow the walk.** Prediction is a depth-first walk below the root, starting after the file just opened. It lists
-  directories through the data directory (`path`) in the order the filesystem returns entries (`getdents`, unsorted).
-  That is the order in which `find` and `grep -r` visit a directory, because every reader of a directory gets the same
-  order. It is filesystem-agnostic. Only placeholders up to `crawlPrefetchMaxFileKiB` (default 1024) are queued.
+  directories through the data directory (`path`) in one of two orders:
+  - **Directory order,** as the filesystem returns entries (`getdents`, unsorted). This is the order `find` and
+    `grep -r` use, because every reader of a directory gets the same order. It is filesystem-agnostic.
+  - **Sorted by name,** as `rg --sort path` and git (index order) visit files.
+
+  Only placeholders up to `crawlPrefetchMaxFileKiB` (default 1024) are queued.
 - **Mispredictions.** A walker opening a placeholder we had not predicted moves the prediction there. If it is outside
-  the root, the root widens to the common ancestor.
+  the root, the root widens to the common ancestor. Each misprediction also tests both orders: the order that has
+  the file among the 32 after the walker's last position is used from then on.
+- **Walkers without an order.** Some walkers have no order we can follow. We sweep the whole subtree from its start
+  (as EdenFS does) instead of following a position, and pause while fewer than 1 in 10 files fetched this far were
+  opened. This happens in two cases:
+  - **Two opens waiting at once.** Several threads or processes are walking, e.g. `rg` or `make -j`. A process waiting
+    for one open at a time never has two.
+  - **Unexplained mispredictions:** at least 3 that neither order explains, making up at least 1 in 8 of the walker's
+    opens.
+- **Learning what the walker skips.** A predicted file 8 positions behind the walker counts as passed by.
+  - **Exclusion:** once 8 files with the same extension, or in directories with the same name, have been passed by and
+    none opened, files like them are no longer predicted, and queued ones are dropped. This handles
+    `grep --include=*.c`, `rg -t`, and walkers skipping `.git`.
+  - **Lifting it:** an open of such a file lifts the exclusion.
+  - **Resets:** the counts reset when the order changes.
 - **Past the root.** When the walk below the root is done, the root widens to its parent and the prediction continues
   after the old root, with the smallest window. The walker's real root is not known (we only see where it started),
   so going on costs at most a few speculative files if it has stopped.
-- **Window.** At most W files are downloaded ahead of the walker and not yet opened by it. W starts at 64, stays
-  between 16 and 1024, and adapts:
+- **Window.** At most W files are downloaded ahead of the walker and not yet opened by it. W starts at 16, stays
+  between 16 and 1024 (a sweep uses 1024), and adapts:
   - **Grows:** doubles whenever the walker opens a predicted file that is still downloading.
   - **Shrinks:** decreases by one for every predicted file the walker passes without opening, i.e. once it has opened
-    a file 64 positions further on. The slack allows for tools that sort the entries of a directory themselves.
+    a file 8 positions further on.
 - **Bytes.** At most 256 MiB, or a tenth of a fixed `cacheBudget` if that is smaller, may be downloaded ahead and not
   yet opened, and at most `crawlPrefetchMaxMiB` (default 1024) per walk in total. Beyond that we stop speculating and
   say so in the log; the walker's own opens are still served.
@@ -112,14 +139,17 @@ handling):
   - a tree of one file per directory at 20 ms RTT, with and without; must be at least 2× faster
   - `find`, `du -a` and `ls -lR` first, which must download nothing
   - contents checked
+- **e2e `crawl_prefetch_other_walkers`:** `grep -r --include=*.c` (at most a quarter of the skipped files fetched),
+  `rg`, `rg --sort path` and `git status`, each at least 2× faster at 20 ms RTT. `rg` and `git` are copied from the
+  host into the containers (`e2e/run.sh`); those cases are skipped without them.
 - **e2e `crawl_prefetch_byte_cap`:** a process that opens files in four directories and then idles costs exactly
   `crawlPrefetchMaxMiB` of lookahead.
 
 ## Open questions
 
-- **Parallel walkers.** `rg` walks with several threads by default, and `git status` reads files in index (sorted)
-  order from several threads. Prediction then leads by directory rather than by file. Mispredictions reposition it,
-  and the window absorbs some reordering, but this is not measured yet (neither tool is in the e2e image).
-- **Filtering walkers** (`grep -r --include=*.c`) never open most predicted files. The window shrinks to 16 but does
-  not stop, so up to `crawlPrefetchMaxMiB` of files the walker skips may be downloaded. Learning the filter, for
-  example by extension, would bound this better.
+- **Stream tables.** Parallel walkers are handled by sweeping the subtree. A table of several streams, each with its
+  own position, as hardware prefetchers keep, would fetch in a better order for large trees with several walker
+  threads, but has not been needed at the sizes measured.
+- **Exclusions by directory name** generalise across the tree (e.g. `.git`, `node_modules`, `build`). A false
+  exclusion costs one fetch per affected name, when the walker opens such a file and lifts it.
+- **Not yet measured on the V8 deployment:** cold `git status` there took 10–15 s with sibling prefetch alone.

@@ -29,6 +29,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -48,17 +49,35 @@ const (
 	crawlIdle = 30 * time.Second
 	// Files downloaded ahead of the walker and not yet opened by it.
 	crawlWindowMin  = 16
-	crawlWindowInit = 64
+	crawlWindowInit = 16
 	crawlWindowMax  = 1024
 	// Bytes downloaded ahead and not yet opened, at most; a tenth of the
 	// cache budget if that is smaller.
 	crawlPendingMax = 256 << 20
 	// A prefetched file this many files behind the walker's position was
-	// passed by (a tool that sorts entries itself reorders within a
-	// directory, so not immediately).
-	crawlSkipSlack   = 64
+	// passed by. Small, since the order is known (sorted walkers are
+	// recognised), so that files a filtering walker skips are learned
+	// quickly.
+	crawlSkipSlack = 8
+	// Without an order (orderSweep), the whole subtree is fetched, as
+	// EdenFS's walk detector does, but paused while fewer than 1 in
+	// crawlSweepMinUse of the files fetched this far were opened, once
+	// crawlSweepLag of them were not.
+	crawlSweepMinUse = 10
+	crawlSweepLag    = 1000
 	crawlMaxActors   = 64
 	crawlMaxProduced = 1 << 16
+	// A misprediction is explained by an order if the missed file is
+	// among this many files after the walker's last position in it.
+	crawlExplainAhead = 32
+	// Mispredictions neither order explains before we stop following the
+	// walker's position and sweep its subtree instead.
+	crawlUnexplainedMax   = 3
+	crawlUnexplainedShare = 8 // ... and at least 1 in this many of its opens
+	// A file extension or directory name is excluded from predictions
+	// once the walker passed this many predicted files with it and opened
+	// none.
+	crawlExcludeAfter = 8
 	// Entries listed per refill round, so that a subtree of local files
 	// does not keep a refill going unchecked.
 	crawlScanChunk = 4096
@@ -73,6 +92,11 @@ type crawlActor struct {
 	id       int
 	touches  []crawlTouch // while detecting
 	lastSeen time.Time
+	// Placeholder opens waiting for their download. A process that waits
+	// for one open at a time never has two: two means several threads or
+	// processes walk at once.
+	inflight int
+	parallel bool
 	lane     *crawlLane // once detected
 }
 
@@ -81,17 +105,41 @@ type crawlTouch struct {
 	dir string
 }
 
+// crawlOrder is how we expect a walker to visit the entries of a
+// directory.
+type crawlOrder int
+
+const (
+	orderDirectory crawlOrder = iota // as listed (getdents): find, grep -r
+	orderSorted                      // by name: rg --sort path, git (index order)
+	orderSweep                       // no usable order (parallel walkers, rg): cover the subtree
+)
+
+func (o crawlOrder) String() string {
+	return [...]string{"directory", "sorted", "sweep"}[o]
+}
+
 // crawlLane is the prediction for one walker. Fields other than walker are
 // protected by crawlTracker.mut; walker belongs to the refill goroutine
 // (refilling).
 type crawlLane struct {
-	exe       string
-	root      string // the walk is below this directory
-	restart   string // reposition the walk after this file
-	refilling bool
-	walker    *treeWalker
-	walkRoot  string
-	done      bool // walk finished
+	exe         string
+	root        string // the walk is below this directory
+	restart     string // reposition the walk after this file
+	refilling   bool
+	walker      *treeWalker
+	walkRoot    string
+	done        bool // walk finished
+	order       crawlOrder
+	last        string   // the walker's last known position
+	misses      []string // unpredicted placeholders it opened, to be explained
+	unexplained int
+
+	// What the walker passes by without opening: by file extension and by
+	// the name of any directory the file is in.
+	skipped, used map[string]int
+	purge         bool // an exclusion was learned
+	rewalk        bool // start the sweep over from the root
 
 	ahead    map[string]aheadFile // prefetched or queued, not yet opened
 	produced map[string]struct{}
@@ -112,8 +160,10 @@ type aheadFile struct {
 }
 
 // crawlTouch records that process pid opened name, which was complete
-// already (hit: we prefetched it) or a placeholder it now waits for.
-func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) {
+// already (hit: we prefetched it) or a placeholder it now waits for. The
+// caller calls the returned function once the open has been served.
+func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) (served func()) {
+	served = func() {}
 	// A process we cannot see (another PID namespace) is reported as 0.
 	if pid <= 0 || f.liveConfig().CrawlPrefetchMaxFileKiB <= 0 {
 		return
@@ -137,6 +187,22 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) {
 		t.actors[id] = a
 	}
 	a.lastSeen = now
+	if !hit {
+		a.inflight++
+		if a.inflight > 1 && !a.parallel {
+			a.parallel = true
+			if a.lane != nil && a.lane.order != orderSweep {
+				a.lane.order = orderSweep
+				a.lane.rewalk = true
+				clear(a.lane.skipped)
+			}
+		}
+		served = func() {
+			t.mut.Lock()
+			a.inflight--
+			t.mut.Unlock()
+		}
+	}
 
 	l := a.lane
 	if l == nil {
@@ -164,9 +230,16 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) {
 			exe:      exe,
 			root:     root,
 			restart:  name,
+			last:     name,
 			ahead:    make(map[string]aheadFile),
 			produced: make(map[string]struct{}),
+			skipped:  make(map[string]int),
+			used:     make(map[string]int),
 			window:   crawlWindowInit,
+		}
+		if a.parallel {
+			l.order = orderSweep
+			l.rewalk = true
 		}
 		a.lane = l
 		a.touches = nil
@@ -175,35 +248,48 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) {
 		delete(l.ahead, name)
 		l.pending -= af.size
 		l.opened++
-		l.pos = max(l.pos, af.seq)
+		l.note(l.used, name)
+		if af.seq > l.pos {
+			l.pos = af.seq
+			l.last = name
+		}
 		if !hit {
 			// The walker waits for a file we are still fetching: go further
 			// ahead.
 			l.waited++
 			l.window = min(l.window*2, crawlWindowMax)
 		}
+		// Without an order, nothing tells us what the walker passed by.
 		for n, o := range l.ahead {
-			if o.seq < l.pos-crawlSkipSlack {
+			if l.order != orderSweep && o.seq < l.pos-crawlSkipSlack {
 				delete(l.ahead, n)
 				l.pending -= o.size
 				l.unused = append(l.unused, n)
 				l.window = max(l.window-1, crawlWindowMin)
+				for _, k := range l.traits(n) {
+					l.skipped[k]++
+					if l.skipped[k] == crawlExcludeAfter && l.used[k] == 0 {
+						l.purge = true // drop what is queued like it
+					}
+				}
 			}
 		}
 	} else if !hit {
 		// A placeholder we did not predict: the walk went elsewhere.
 		l.missed++
+		l.note(l.used, name)
 		if !inDir(name, l.root) {
 			l.root = commonDir(l.root, dir)
-			l.restart = name
-		} else if _, ok := l.produced[name]; !ok {
-			l.restart = name
+		}
+		if _, ok := l.produced[name]; !ok && len(l.misses) < 16 {
+			l.misses = append(l.misses, name)
 		}
 	}
 	if !l.refilling {
 		l.refilling = true
 		go f.crawlRefill(a, l)
 	}
+	return served
 }
 
 // crawlRefill tops up the lane's window from its walk.
@@ -227,15 +313,36 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 		l.restart = ""
 		unused := l.unused
 		l.unused = nil
-		if restart != "" {
+		misses, last, order := l.misses, l.last, l.order
+		l.misses = nil
+		sweepFromStart := l.rewalk
+		l.rewalk = false
+		if l.purge {
+			l.purge = false
+			dropped := f.od.pf.filterLane(a.id, func(name string) bool { return !l.excluded(name) })
+			for _, name := range dropped {
+				if af, ok := l.ahead[name]; ok {
+					delete(l.ahead, name)
+					l.pending -= af.size
+				}
+			}
+			f.sl.Debug("Tree walk skips some files; not prefetching files like them", "exe", l.exe, "pgid", a.id, "dropped", len(dropped), "opened", l.opened, "prefetched", len(l.produced))
+		}
+		if restart != "" || sweepFromStart {
 			l.done = false
 		}
 		need := l.window - len(l.ahead)
+		if l.order == orderSweep {
+			need = crawlWindowMax - len(l.ahead)
+			if n := len(l.produced); n-l.opened > crawlSweepLag && l.opened*crawlSweepMinUse < n {
+				need = 0
+			}
+		}
 		pendingRoom, totalRoom := pendingMax-l.pending, maxTotal-l.total // bytes
 		if maxFile <= 0 || pendingRoom <= 0 || totalRoom <= 0 || l.capped {
 			need = 0
 		}
-		if (need <= 0 || l.done) && restart == "" && len(unused) == 0 {
+		if (need <= 0 || l.done) && restart == "" && len(unused) == 0 && len(misses) == 0 && l.walkRoot == root && !sweepFromStart {
 			l.refilling = false
 			t.mut.Unlock()
 			return
@@ -245,11 +352,58 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 		for _, name := range unused {
 			f.crawlUnmark(name)
 		}
-		if restart != "" || l.walker == nil || l.walkRoot != root {
+		// Which order explains where the walker went?
+		base := f.mtimefs.URI()
+		unexplained := 0
+		for _, m := range misses {
+			if order == orderSweep {
+				break
+			}
+			switch {
+			case explains(base, root, last, m, order):
+			case explains(base, root, last, m, 1-order):
+				order = 1 - order
+				f.sl.Debug("Tree walk follows another order", "exe", l.exe, "pgid", a.id, "order", order)
+			default:
+				unexplained++
+				f.sl.Debug("Tree walk went somewhere we did not expect", "exe", l.exe, "pgid", a.id, slogutil.FilePath(m), "after", last, "order", order)
+			}
+			restart, last = m, m
+		}
+		if len(misses) > 0 {
+			t.mut.Lock()
+			l.unexplained += unexplained
+			// Only if they are a real share of its opens: a sequential
+			// walker that reads a few other files (git reading objects
+			// after comparing the work tree) keeps its order.
+			if l.order != orderSweep && l.unexplained >= crawlUnexplainedMax && l.unexplained*crawlUnexplainedShare >= l.opened {
+				order = orderSweep
+				f.sl.Debug("Tree walk has no order we can follow; covering its subtree", "exe", l.exe, "pgid", a.id)
+			}
+			l.last = last
+			if order == orderSweep {
+				// Parallel walkers are ahead and behind their latest
+				// position at once: cover the whole subtree.
+				sweepFromStart = sweepFromStart || l.order != orderSweep || restart != ""
+				restart = ""
+				l.done = false
+			}
+			if order != l.order {
+				// What the walker seemed to pass by in the wrong order
+				// means nothing.
+				clear(l.skipped)
+			}
+			l.order = order
+			t.mut.Unlock()
+		}
+		if order == orderSweep && (sweepFromStart || l.walker == nil || l.walkRoot != root) {
+			l.walker = newTreeWalker(base, root, "", false)
+			l.walkRoot = root
+		} else if restart != "" || l.walker == nil || l.walkRoot != root || l.walker.sorted != (order == orderSorted) {
 			if restart == "" {
 				restart = l.walker.position()
 			}
-			l.walker = newTreeWalker(f.mtimefs.URI(), root, restart)
+			l.walker = newTreeWalker(base, root, restart, order == orderSorted)
 			l.walkRoot = root
 		}
 		if need <= 0 {
@@ -274,6 +428,12 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 				continue
 			}
 			if _, _, ok := hsm.ReadPlaceholder(abs); !ok {
+				continue
+			}
+			t.mut.Lock()
+			excluded := l.order != orderSweep && l.excluded(name)
+			t.mut.Unlock()
+			if excluded {
 				continue
 			}
 			if fi.Size() > totalRoom {
@@ -311,7 +471,9 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 			l.total += sizes[i]
 		}
 		if done {
-			if l.root != "" && l.root == l.walkRoot && l.restart == "" {
+			// A sweep says nothing about where the walker goes next; it
+			// widens only when the walker opens a file outside it.
+			if l.order != orderSweep && l.root != "" && l.root == l.walkRoot && l.restart == "" {
 				// The directory we took for the walk's root is done, but
 				// the walker may well go on (we only saw where it began).
 				// Continue after it in its parent, with a small window
@@ -336,6 +498,53 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 		t.mut.Unlock()
 		f.od.pf.pushLane(a.id, names)
 	}
+}
+
+// note counts name's extension and the names of the directories it is in
+// in stats.
+func (l *crawlLane) note(stats map[string]int, name string) {
+	for _, k := range l.traits(name) {
+		stats[k]++
+	}
+}
+
+func (l *crawlLane) traits(name string) []string {
+	parts := strings.Split(name, "/")
+	keys := make([]string, 0, len(parts))
+	keys = append(keys, "ext:"+path.Ext(parts[len(parts)-1]))
+	for _, d := range parts[:len(parts)-1] {
+		keys = append(keys, "dir:"+d)
+	}
+	return keys
+}
+
+// excluded reports whether the walker keeps passing by files like name.
+func (l *crawlLane) excluded(name string) bool {
+	for _, k := range l.traits(name) {
+		if l.skipped[k] >= crawlExcludeAfter && l.used[k] == 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// explains reports whether a walk in order o from the file after
+// continues to name within crawlExplainAhead files.
+func explains(base, root, after, name string, o crawlOrder) bool {
+	if after == "" || o == orderSweep {
+		return false
+	}
+	w := newTreeWalker(base, root, after, o == orderSorted)
+	for range crawlExplainAhead {
+		n, ok := w.next()
+		if !ok {
+			return false
+		}
+		if n == name {
+			return true
+		}
+	}
+	return false
 }
 
 // crawlExpects reports whether a walker has yet to open name, which we
@@ -408,8 +617,9 @@ func (f *sendReceiveFolder) crawlJanitor(ctx context.Context) {
 // treeWalker lists the regular files below a directory depth-first, in the
 // order the filesystem returns directory entries.
 type treeWalker struct {
-	base  string // the folder's absolute path
-	stack []walkFrame
+	base   string // the folder's absolute path
+	sorted bool   // by name instead of directory order
+	stack  []walkFrame
 }
 
 type walkFrame struct {
@@ -420,8 +630,8 @@ type walkFrame struct {
 
 // newTreeWalker walks root, starting after the file after if it is below
 // root.
-func newTreeWalker(base, root, after string) *treeWalker {
-	w := &treeWalker{base: base}
+func newTreeWalker(base, root, after string, sorted bool) *treeWalker {
+	w := &treeWalker{base: base, sorted: sorted}
 	w.push(root)
 	if after == "" || !inDir(after, root) {
 		return w
@@ -456,6 +666,9 @@ func (w *treeWalker) push(dir string) {
 	if d, err := os.Open(filepath.Join(w.base, dir)); err == nil {
 		entries, _ = d.ReadDir(-1) // directory order, unsorted
 		d.Close()
+		if w.sorted {
+			slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+		}
 	}
 	w.stack = append(w.stack, walkFrame{dir: dir, entries: entries})
 }

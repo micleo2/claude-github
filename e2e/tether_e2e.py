@@ -138,8 +138,19 @@ class Node:
         return conns.get(other.id, {}).get("connected", False)
 
     def pause(self, other):
-        self.api("POST", f"/rest/system/pause?device={other.id}")
-        wait_for(lambda: not self.connected(other), 30, what=f"{self.name} disconnected from {other.name}")
+        # A connection dialled just as the device is paused can survive the
+        # pause (upstream Syncthing race, seen right after an address
+        # change); pausing again closes it.
+        for attempt in range(3):
+            self.api("POST", f"/rest/system/pause?device={other.id}")
+            try:
+                wait_for(lambda: not self.connected(other), 10, what=f"{self.name} disconnected from {other.name}")
+                return
+            except AssertionError:
+                if attempt == 2:
+                    raise
+                self.api("POST", f"/rest/system/resume?device={other.id}")
+                time.sleep(1)
 
     def resume(self, other):
         self.api("POST", f"/rest/system/resume?device={other.id}")
@@ -996,6 +1007,74 @@ def crawl_prefetch_under_latency(c):
     print(f"      grep -r over {dirs * sub} directories with one file each, 20 ms RTT: ahead-of-walk prefetch "
           f"off {results['off']:.1f}s, on {results['on']:.1f}s ({results['off'] / results['on']:.1f}x)")
     assert results["on"] * 2 < results["off"], results
+
+
+TOOLS = "env LD_LIBRARY_PATH=/opt/tether/tools/lib GIT_CONFIG_NOSYSTEM=1 HOME=/tmp"
+
+
+def have_tool(name):
+    return os.path.exists(os.path.join(BIN_DIR, "tools", name))
+
+
+def mixed_tree(c, root, dirs, sub, exts, seed):
+    rnd = random.Random(seed)
+    names = []
+    for d in range(dirs):
+        for e in range(sub):
+            rel = f"{root}/d{d:02}/e{e:02}/f{exts[(d * sub + e) % len(exts)]}"
+            FILES[rel] = rnd.randbytes(600)
+            path = c.server.lower(rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(FILES[rel])
+            names.append(rel)
+    return names
+
+
+@test
+def crawl_prefetch_other_walkers(c):
+    """Sorted (rg --sort, git status), parallel (rg) and filtering (grep --include) walkers, 20 ms RTT."""
+    n = c.c2
+    cases = [("grep --include", None, "grep -rl --include='*.c' --binary-files=text . {d} | wc -l")]
+    if have_tool("rg"):
+        cases += [("rg", "rg", TOOLS + " /opt/tether/tools/rg -l --no-ignore -a . {d} | wc -l"),
+                  ("rg --sort path", "rg", TOOLS + " /opt/tether/tools/rg -l --no-ignore -a --sort path . {d} | wc -l")]
+    if have_tool("git"):
+        cases += [("git status", "git", "cd {d} && " + TOOLS + " /opt/tether/tools/git -c safe.directory='*' status --porcelain | wc -l")]
+    for i, (label, _, cmd) in enumerate(cases):
+        times = {}
+        for mode, kib in (("off", 0), ("on", 1024)):
+            set_folder(n, crawlPrefetchMaxFileKiB=kib)
+            root = f"walk{i}-{mode}"
+            exts = (".c", ".txt", ".txt", ".txt") if label == "grep --include" else (".c", ".h")
+            # The filter is learned after a few files; a bigger tree shows what it saves.
+            dirs, sub = (30, 20) if label == "grep --include" else (20, 10)
+            names = mixed_tree(c, root, dirs, sub, exts, 80 + i)
+            extra = []
+            if label == "git status":
+                subprocess.run(f"cd '{c.server.lower(root)}' && git init -q && git add -A && "
+                               "git -c user.name=t -c user.email=t@t commit -qm init && chmod -R a+rwX .",
+                               shell=True, check=True)
+                extra = [f"{root}/.git/index"]
+            c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={root}")
+            last = (extra or names)[-1]
+            wait_for(lambda: n.is_placeholder(last) and c.synced(n, last), 120, what=f"{root} placeholders")
+            time.sleep(1)
+            with SlowLink(c, 10):
+                t0 = time.time()
+                out = n.sh(cmd.format(d=f"'{VIEW}/{root}'")).stdout.strip()
+                times[mode] = time.time() - t0
+            want = {"grep --include": len(names) // 4, "git status": 0}.get(label, len(names))
+            assert out == str(want), (label, mode, out)
+            if label == "grep --include" and mode == "on":
+                others = [r for r in names if not r.endswith(".c")]
+                fetched = sum(not n.is_placeholder(r) for r in others)
+                # Learned after a few skipped files; before that, one window.
+                assert fetched <= len(others) // 4, f"{fetched} of {len(others)} skipped files fetched"
+                print(f"      grep --include fetched {fetched} of {len(others)} files it skips")
+        print(f"      {label}: off {times['off']:.1f}s, on {times['on']:.1f}s ({times['off'] / times['on']:.1f}x)")
+        assert times["on"] * 2 < times["off"], (label, times)
+    set_folder(n, crawlPrefetchMaxFileKiB=1024)
 
 
 @test
