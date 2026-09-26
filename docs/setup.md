@@ -41,15 +41,24 @@ syncthing serve --home ~/.local/state/tether --no-browser
 
 ## 3. Client daemon
 
-The client needs `CAP_SYS_ADMIN` (fanotify pre-content groups and mount marks are privileged), so for now it runs as
-root:
+The client needs `CAP_SYS_ADMIN` (fanotify pre-content groups and mount marks are privileged). Rather than running the
+daemon as root, give a root-owned copy of the binary that capability and run it as yourself, so downloaded files are
+yours:
 
 ```sh
-sudo syncthing serve --home /var/lib/tether --no-browser --gui-address 127.0.0.1:8384
+sudo install -m755 -o root -g root syncthing /usr/local/bin/tether-syncthing
+sudo setcap cap_sys_admin+ep /usr/local/bin/tether-syncthing
+tether-syncthing serve --home ~/.local/state/tether-client --no-browser
 ```
 
-Keep the `serve` command. It runs a small monitor process which unmounts the on-demand view if the main process
-crashes, so placeholders are never readable as zeros.
+- **Run it long-term** as a systemd user service with `ExecStart` as above. `loginctl enable-linger` keeps it running
+  without a login session.
+- **Coexisting with Syncthing:** if a normal Syncthing already runs on this machine, give tether other ports. Set the
+  GUI address in the config (*Settings → GUI*, or `PATCH /rest/config/gui`) rather than with `--gui-address`, which is
+  not saved, so the `tether` CLI finds the right daemon. Set the sync port in `listenAddresses`.
+- **Keep the `serve` command.** It runs a small monitor process which unmounts the on-demand view if the main process
+  crashes, so placeholders are never readable as zeros from the host.
+- **Self-upgrade is compiled out.** Syncthing's release feed would replace tether with stock Syncthing.
 
 ## 4. Pair client and server
 
@@ -60,28 +69,30 @@ crashes, so placeholders are never readable as zeros.
 - **Optional:** with an explicit server address you can disable global discovery, local discovery and relays on the
   clients (*Settings → Connections*).
 
-## 5. Create the on-demand folder on the client, then share it
+## 5. Make the client on-demand, then accept the share
 
-**Order matters.** If the client simply accepts the server's share offer, it creates a *normal* folder and starts
-downloading everything. Create the folder on the client first, with the same folder ID:
+Turn on on-demand in the client's **default folder settings**, once. Every folder the client accepts after that is
+on-demand, whether through the GUI's accept button, auto-accept or REST:
 
 ```sh
-KEY=$(sudo sed -n 's:.*<apikey>\(.*\)</apikey>.*:\1:p' /var/lib/tether/config.xml)
-curl -X PUT -H "X-API-Key: $KEY" http://127.0.0.1:8384/rest/config/folders/docs -d '{
-  "id": "docs", "label": "Docs", "type": "sendreceive",
-  "path": "/var/lib/tether/data/docs",
-  "devices": [{"deviceID": "<CLIENT-ID>"}, {"deviceID": "<SERVER-ID>"}],
-  "onDemand": true,
-  "onDemandView": "/home/me/Docs",
-  "cacheBudget": {"value": 20, "unit": "GB"}
-}'
+KEY=$(sed -n 's:.*<apikey>\(.*\)</apikey>.*:\1:p' ~/.local/state/tether-client/config.xml)
+curl -X PATCH -H "X-API-Key: $KEY" http://127.0.0.1:8384/rest/config/defaults/folder \
+  -d '{"onDemand": true, "path": "/home/me"}'
 ```
 
-- **`path`** is the real directory the daemon works in. Put it somewhere users don't browse.
-- **`onDemandView`** is where you work. tether mounts it while the daemon runs. It must not overlap `path`.
+Then, on the server, share the folder with the client (edit the folder → *Sharing*) and accept it on the client. For a
+folder labelled `Docs`, the default path above gives `/home/me/Docs`:
 
-Then, on the server, share `docs` with the client (edit the folder → *Sharing*). The two connect, and within seconds
-the whole tree appears under `~/Docs` as online-only files.
+- **The path you choose** becomes the view, where you work. It must be empty; tether refuses to mount over files.
+- **The synced data** goes to `<data dir>/ondemand/<folder ID>` (`~/.local/state/tether-client/ondemand/…` here). Don't
+  use it directly.
+- **Within seconds** the whole tree appears as online-only files.
+
+To place the data yourself, set both `path` and `onDemandView` when creating the folder. An on-demand folder that
+can't run (no view, not send-receive, no kernel support) stops with an error. It never falls back to downloading
+everything.
+
+The server needs none of this. Leave its defaults alone, so that a folder it accepts is a full copy.
 
 ## 6. Use it
 
@@ -107,10 +118,12 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
 
 ## Known rough edges
 
-- **File ownership.** The client daemon runs as root, so downloaded files are owned by root, and a normal user may not
-  be able to write them through the view. Syncthing's `copyOwnershipFromParent` folder option (with `path` owned by
-  the user) should give files the user's ownership. This has not been tested with placeholders. The proper fix is the
-  planned split into a small privileged helper and an unprivileged per-user daemon.
+- **Sandboxes read placeholders as zeros.** Processes in another mount namespace (docker `-v`, flatpak/bwrap,
+  `unshare`) get an unmarked copy of the view. See
+  [research/placeholder-access-paths.md](research/placeholder-access-paths.md); the fix (per-placeholder inode marks) is
+  in progress. Until then, don't open on-demand folders from sandboxed apps.
+- **Privileges.** With `setcap`, anyone who can run that binary gets `CAP_SYS_ADMIN` in it. The planned fix is a small
+  privileged helper plus an unprivileged per-user daemon.
 - **Settings UI.** The GUI has no dedicated on-demand controls. The fields should show up in the folder's *Advanced*
   editor, but that is untested; REST, `config.xml` and the `tether` CLI are the tested routes.
-- **Auto-accept.** Don't enable "auto accept" for shared folders on clients. It creates normal, full-download folders.
+- **Auto-accept** creates the view under the default path and refuses a path that already exists.

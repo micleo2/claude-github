@@ -35,6 +35,7 @@ const (
 	GUIAssets      LocationEnum = "guiAssets"
 	DefFolder      LocationEnum = "defFolder"
 	LockFile       LocationEnum = "lockFile"
+	OnDemandData   LocationEnum = "onDemandData"
 )
 
 type BaseDirEnum string
@@ -129,6 +130,7 @@ var locationTemplates = map[LocationEnum]string{
 	GUIAssets:      "${config}/gui",
 	DefFolder:      "${userHome}/Sync",
 	LockFile:       "${data}/syncthing.lock",
+	OnDemandData:   "${data}/ondemand",
 }
 
 var locations = make(map[LocationEnum]string)

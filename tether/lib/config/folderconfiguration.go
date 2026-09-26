@@ -342,14 +342,35 @@ func (f *FolderConfiguration) prepare(myID protocol.DeviceID, existingDevices ma
 		f.IgnorePerms = true
 	}
 
-	if f.OnDemand && f.Type != FolderTypeSendReceive {
-		slog.Warn("On-demand files are only supported for send-receive folders; disabling", "folder", f.Description(), "type", f.Type)
-		f.OnDemand = false
+	// An unusable on-demand setting is kept as is: the folder then refuses
+	// to start (see folder.getHealthErrorWithoutIgnores). Clearing it would
+	// turn the folder into a normal one that downloads everything.
+}
+
+// deriveOnDemandView fills in the view of an on-demand folder configured
+// with only a path, as a folder accepted from a share offer is when the
+// defaults have onDemand set. The chosen path becomes the view, where the
+// user sees the files, and the synced data moves to lowerRoot/<folder ID>.
+func (f *FolderConfiguration) deriveOnDemandView(lowerRoot string) {
+	if !f.OnDemand || f.OnDemandView != "" || lowerRoot == "" {
+		return
 	}
-	if f.OnDemand && f.OnDemandView == "" {
-		slog.Warn("On-demand folder has no view path; disabling on-demand files", "folder", f.Description())
-		f.OnDemand = false
+	view, err := fs.ExpandTilde(f.Path)
+	if err != nil {
+		return
 	}
+	view = filepath.Clean(view)
+	if view == lowerRoot || strings.HasPrefix(view, lowerRoot+string(filepath.Separator)) {
+		// Already a derived path (e.g. the view was cleared by hand);
+		// leave it for the folder to report.
+		return
+	}
+	name := fs.SanitizePath(f.ID)
+	if name == "" {
+		return
+	}
+	f.OnDemandView = view
+	f.Path = filepath.Join(lowerRoot, name)
 }
 
 // RequiresRestartOnly returns a copy with only the attributes that require

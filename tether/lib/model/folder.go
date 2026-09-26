@@ -396,6 +396,9 @@ func (f *folder) getHealthErrorWithoutIgnores() error {
 		return err
 	}
 
+	if f.OnDemand && f.Type != config.FolderTypeSendReceive {
+		return fmt.Errorf("on-demand files need a send-receive folder, not %s", f.Type)
+	}
 	if sr, ok := f.puller.(*sendReceiveFolder); ok && f.OnDemand {
 		sr.od.mut.Lock()
 		err := sr.od.viewErr

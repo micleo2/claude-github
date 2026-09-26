@@ -25,6 +25,7 @@ import (
 	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/netutil"
 	"github.com/syncthing/syncthing/lib/protocol"
 	"github.com/syncthing/syncthing/lib/sliceutil"
@@ -370,6 +371,7 @@ func (cfg *Configuration) prepareFolders(myID protocol.DeviceID, existingDevices
 			return nil, fmt.Errorf("folder %q: %w", folder.ID, errFolderIDDuplicate)
 		}
 
+		folder.deriveOnDemandView(locations.Get(locations.OnDemandData))
 		folder.prepare(myID, existingDevices)
 
 		existingFolders[folder.ID] = folder

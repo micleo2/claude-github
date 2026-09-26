@@ -4,7 +4,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this file,
 // You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//go:build noupgrade || ios
+//go:build !stupgrade || ios
+
+// tether: upgrades are off unless built with -tags stupgrade. The release
+// feed is upstream Syncthing's, and since v2.1.5-tether sorts before v2.1.5,
+// every tether node would otherwise replace itself with stock Syncthing.
 
 package upgrade
 

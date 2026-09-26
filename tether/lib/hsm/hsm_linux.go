@@ -126,33 +126,60 @@ func New(handler Handler, policy Policy, log *slog.Logger) (*Listener, error) {
 
 // AddView mounts lower at path with the fanotify mark in place before the
 // mount is reachable at path.
+//
+// The view is two mounts. The bottom one is path bound onto itself and made
+// private, so that the marked mount above it never propagates: a fanotify mark
+// belongs to one mount, and a copy propagated into another mount namespace
+// (containers, flatpak) would show placeholders unmarked, i.e. as zeros. Such
+// namespaces see only the bottom mount, an empty directory. The marked mount is
+// a detached clone of lower that is marked before being attached; unlike
+// MS_MOVE this works when the parent mounts are shared, as they are on any
+// systemd host.
 func (l *Listener) AddView(v *View) error {
 	if err := os.MkdirAll(v.Path, 0o755); err != nil {
 		return err
 	}
-	if mounted(v.Path) {
-		// Left over from a crash; it is unmarked and therefore unsafe.
-		if err := unix.Unmount(v.Path, unix.MNT_DETACH); err != nil {
-			return fmt.Errorf("remove stale view %s: %w", v.Path, err)
-		}
+	// Anything mounted here is left over from a crash; it is unmarked and
+	// therefore unsafe.
+	if err := UnmountView(v.Path); err != nil {
+		return fmt.Errorf("remove stale view %s: %w", v.Path, err)
 	}
-	staging, err := os.MkdirTemp("", "tether-view-")
-	if err != nil {
+	// Mounting over existing files would hide them for as long as tether
+	// runs.
+	if ents, err := os.ReadDir(v.Path); err != nil {
+		return err
+	} else if len(ents) > 0 {
+		return fmt.Errorf("view path %s is not empty", v.Path)
+	}
+	if err := unix.Mount(v.Path, v.Path, "", unix.MS_BIND, ""); err != nil {
+		return fmt.Errorf("bind %s: %w", v.Path, err)
+	}
+	fail := func(err error) error {
+		_ = UnmountView(v.Path)
 		return err
 	}
-	defer os.Remove(staging)
-	// Keep the staging mount private so it never propagates anywhere.
-	if err := unix.Mount(v.Lower, staging, "", unix.MS_BIND, ""); err != nil {
-		return fmt.Errorf("bind %s: %w", v.Lower, err)
+	if err := unix.Mount("", v.Path, "", unix.MS_PRIVATE, ""); err != nil {
+		return fail(fmt.Errorf("make %s private: %w", v.Path, err))
 	}
-	_ = unix.Mount("", staging, "", unix.MS_PRIVATE, "")
-	if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, eventMask, unix.AT_FDCWD, staging); err != nil {
-		unix.Unmount(staging, unix.MNT_DETACH)
-		return fmt.Errorf("fanotify_mark %s: %w", staging, err)
+	tree, err := unix.OpenTree(unix.AT_FDCWD, v.Lower, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err != nil {
+		return fail(fmt.Errorf("clone %s: %w", v.Lower, err))
 	}
-	if err := unix.Mount(staging, v.Path, "", unix.MS_MOVE, ""); err != nil {
-		unix.Unmount(staging, unix.MNT_DETACH)
-		return fmt.Errorf("move view to %s: %w", v.Path, err)
+	defer unix.Close(tree)
+	// A clone keeps the source's propagation and would join the peer group
+	// of lower's mount. Unbindable also keeps the view out of bind-based
+	// sandboxes (flatpak, docker -v, podman): their binds skip it and show
+	// the empty directory below, where a copy would be unmarked.
+	if err := unix.MountSetattr(tree, "", unix.AT_EMPTY_PATH, &unix.MountAttr{Propagation: unix.MS_UNBINDABLE}); err != nil {
+		return fail(fmt.Errorf("make view of %s unbindable: %w", v.Lower, err))
+	}
+	// tree is an O_PATH fd, which fanotify_mark rejects without a path;
+	// "." resolves through it to the root of the detached mount.
+	if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, eventMask, tree, "."); err != nil {
+		return fail(fmt.Errorf("fanotify_mark %s: %w", v.Lower, err))
+	}
+	if err := unix.MoveMount(tree, "", unix.AT_FDCWD, v.Path, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
+		return fail(fmt.Errorf("attach view at %s: %w", v.Path, err))
 	}
 	l.mu.Lock()
 	l.views = append(l.views, v)
@@ -171,7 +198,21 @@ func (l *Listener) RemoveView(path string) error {
 		}
 	}
 	l.mu.Unlock()
-	return unix.Unmount(path, unix.MNT_DETACH)
+	return UnmountView(path)
+}
+
+// UnmountView detaches every mount stacked at path (a view is two; see
+// AddView). Nothing mounted there is not an error.
+func UnmountView(path string) error {
+	for i := 0; i < 8 && mounted(path); i++ {
+		if err := unix.Unmount(path, unix.MNT_DETACH); err != nil {
+			if err == unix.EINVAL || err == unix.ENOENT {
+				return nil
+			}
+			return err
+		}
+	}
+	return nil
 }
 
 // Close unmounts all views and closes the group. Blocked accessors are
@@ -183,7 +224,7 @@ func (l *Listener) Close() error {
 		l.views = nil
 		l.mu.Unlock()
 		for _, v := range views {
-			_ = unix.Unmount(v.Path, unix.MNT_DETACH)
+			_ = UnmountView(v.Path)
 		}
 		l.closeErr = unix.Close(l.fd)
 	})

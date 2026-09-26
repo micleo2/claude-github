@@ -1,4 +1,5 @@
 /syncthing
+/tether
 /stdiscosrv
 *.tar.gz
 *.zip

@@ -14,9 +14,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"golang.org/x/sys/unix"
-
 	"github.com/syncthing/syncthing/internal/slogutil"
+	"github.com/syncthing/syncthing/lib/hsm"
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/model"
 )
@@ -33,7 +32,7 @@ func unmountStaleOnDemandViews() {
 		if view == "" {
 			continue
 		}
-		if err := unix.Unmount(view, unix.MNT_DETACH); err != nil && err != unix.EINVAL && err != unix.ENOENT {
+		if err := hsm.UnmountView(view); err != nil {
 			slog.Error("Failed to unmount stale on-demand view", slogutil.FilePath(view), slogutil.Error(err))
 			continue
 		}

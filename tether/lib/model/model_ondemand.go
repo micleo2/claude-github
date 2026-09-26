@@ -122,6 +122,9 @@ func (m *model) hsmAddView(cfg config.FolderConfiguration) error {
 		}()
 		m.od.l, m.od.cancel = l, cancel
 	}
+	if cfg.OnDemandView == "" {
+		return errors.New("no view path (onDemandView) configured")
+	}
 	lower := cfg.Filesystem().URI()
 	view := filepath.Clean(cfg.OnDemandView)
 	if view == lower || strings.HasPrefix(view, lower+string(filepath.Separator)) || strings.HasPrefix(lower, view+string(filepath.Separator)) {
