@@ -142,7 +142,7 @@ func newSendReceiveFolder(model *model, ignores *ignore.Matcher, cfg config.Fold
 		queue:              newJobQueue(),
 		blockPullReorderer: newBlockPullReorderer(cfg.BlockPullOrder, model.id, cfg.DeviceIDs()),
 		writeLimiter:       semaphore.New(cfg.MaxConcurrentWrites),
-		od:                 newOnDemandState(),
+		od:                 newOnDemandState(model.hydrationState(cfg.ID)),
 	}
 	f.puller = f
 

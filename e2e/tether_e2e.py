@@ -1246,6 +1246,33 @@ def scan_while_being_made_durable(c):
 
 
 @test
+def folder_restart_while_being_made_durable(c):
+    """A configuration change restarts the folder while downloads are being made durable: reads keep working."""
+    n = c.c1
+    restart_with(n, ["TETHER_FINISH_DELAY=3s"])
+    try:
+        rels = [f"durable-restart/{i}.bin" for i in range(5)]
+        for i, rel in enumerate(rels):
+            FILES[rel] = random.Random(90 + i).randbytes(20 * 1024)
+            c.write_server(rel, FILES[rel])
+        for rel in rels:
+            c.wait_placeholder(n, rel)
+        assert n.view_sha(rels[0]) == sha(FILES[rels[0]])  # the others get prefetched
+        cfg = n.api("GET", f"/rest/config/folders/{FOLDER}")
+        cfg["fsWatcherDelayS"] = cfg["fsWatcherDelayS"] + 1
+        n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)  # restarts the folder
+        for _ in range(3):
+            for rel in rels:
+                p = n.sh(f"timeout 10 sha256sum '{VIEW}/{rel}'", check=False)
+                assert p.returncode == 0 and p.stdout.split()[0] == sha(FILES[rel]), (rel, p.returncode, p.stderr)
+            time.sleep(1)
+        wait_for(lambda: all(not n.is_placeholder(r) and not n.db_file(r)["local"]["localFlags"] & 128 for r in rels),
+                 30, what="all durable and recorded")
+    finally:
+        restart_with(n)
+
+
+@test
 def crash_while_being_made_durable(c):
     """A crash after a download completes but before it is durable leaves a placeholder or the content, never zeros."""
     n = c.c1

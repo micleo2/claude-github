@@ -64,6 +64,25 @@ type modelOnDemand struct {
 
 	discMut     sync.Mutex
 	disconnects map[protocol.DeviceID]time.Time
+
+	// Per folder ID, across folder restarts (see onDemandState).
+	hydrations map[string]*hydrationState
+}
+
+// hydrationState returns the hydration bookkeeping of the folder, which
+// every instance of it shares.
+func (m *model) hydrationState(folder string) *hydrationState {
+	m.od.mut.Lock()
+	defer m.od.mut.Unlock()
+	if m.od.hydrations == nil {
+		m.od.hydrations = make(map[string]*hydrationState)
+	}
+	hs, ok := m.od.hydrations[folder]
+	if !ok {
+		hs = newHydrationState()
+		m.od.hydrations[folder] = hs
+	}
+	return hs
 }
 
 func (o *modelOnDemand) noteDisconnect(dev protocol.DeviceID) {

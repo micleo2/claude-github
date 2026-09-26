@@ -163,7 +163,17 @@ follows restoring the recorded mtime, and any later write changes it.
 4. **Read-only files** (git objects, 0444): the background `Finish` runs after the file's mode is restored, and
    removing a `user.*` xattr needs write permission. xattr updates now add the owner's write bit for a moment on
    `EACCES`. Test: `TestOpenForWriteReadOnlyFile`, run as `nobody`.
-5. **A race introduced by marking before evicting** (`stale-placeholders.md` §4): a reader opening the file between
+5. **Two hydrations of one file, back to back.** A second caller could check "complete?" (no) just before the first
+   hydration completed and released its slot, then take the free slot and hydrate again. That cleared the completion
+   flag under the background finisher. The re-check after taking the slot used to be "still a placeholder?", which is
+   still true inside the window; it now also checks "complete?". The first hydration marks the file complete before
+   it releases the slot.
+6. **Folder restarts.** Any configuration change restarts the folder. The slot table, the completion set and the index
+   lock lived in the folder instance, so the new instance ignored the old one's hydrations and finishers. They now live
+   in the model, per folder ID. Test: e2e `folder_restart_while_being_made_durable`.
+   - **Live repro before 5 and 6:** a config change followed by a cold read of the tree failed 2 reads in 1–2 of every
+     6 cycles. After: 0 in 12 cycles (about 238,000 reads).
+7. **A race introduced by marking before evicting** (`stale-placeholders.md` §4): a reader opening the file between
    the eviction's mark and the placeholder state made the listener remove the fresh mark. The listener now leaves
    inodes being evicted alone.
 
@@ -174,7 +184,7 @@ follows restoring the recorded mtime, and any later write changes it.
 | Cold read of a 3.7 KB file | 7.5 ms | 1.7 ms |
 | Cold read of a 3.1 KB file (a new directory) | 14 ms | 4–7 ms |
 | `cat` of all 199 files of a cold `src/heap` | 197 ms | 88–91 ms |
-| Cold read of the whole tree, 19,816 files (`sha256sum -c`) | 55 s | **10–15 s**, 0 errors in 6 runs |
+| Cold read of the whole tree, 19,816 files (`sha256sum -c`) | 55 s | **9.4–15 s**, 0 errors in 28 runs |
 | Cold `git status` | 54.6 s | **9.6–15 s** |
 | Warm `git status` | 0.5 s | 0.2–0.5 s |
 

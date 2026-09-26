@@ -60,9 +60,25 @@ var (
 
 // onDemandState is the per-folder bookkeeping for on-demand files.
 type onDemandState struct {
+	// Shared by every instance of this folder: a folder restarts on any
+	// configuration change, while hydrations and background finishers of
+	// the previous instance may still be running on the same files.
+	*hydrationState
+
 	maintenancePending atomic.Bool
 	started            time.Time
 
+	pf prefetchQueue
+
+	mut     sync.Mutex
+	pinKey  string
+	pins    *ignore.Matcher
+	viewErr error
+}
+
+// hydrationState coordinates hydrations of a folder's files. It outlives
+// folder restarts (model.hydrationState).
+type hydrationState struct {
 	// Hydrated files whose index entries still say "placeholder". They are
 	// committed in batches, off the path of the waiting application.
 	hydratedMut sync.Mutex
@@ -90,26 +106,28 @@ type onDemandState struct {
 	flightMut sync.Mutex
 	flights   map[string]*hydrationFlight
 
-	pf prefetchQueue
-
-	mut       sync.Mutex
-	hydrating map[string]int
-	pinKey    string
-	pins      *ignore.Matcher
-	viewErr   error
+	// Files being hydrated or made durable, which the scanner leaves alone.
+	hydratingMut sync.Mutex
+	hydrating    map[string]int
 }
 
-func newOnDemandState() *onDemandState {
-	return &onDemandState{
+func newHydrationState() *hydrationState {
+	return &hydrationState{
 		hydrating:   make(map[string]int),
-		started:     time.Now(),
 		hydrated:    make(map[string][]byte),
 		hydratedC:   make(chan struct{}, 1),
 		flushPuller: make(chan struct{}, 1),
 		complete:    make(map[[2]uint64]struct{}),
 		finishSem:   make(chan struct{}, maxFinishing),
 		flights:     make(map[string]*hydrationFlight),
-		pf:          newPrefetchQueue(),
+	}
+}
+
+func newOnDemandState(hs *hydrationState) *onDemandState {
+	return &onDemandState{
+		hydrationState: hs,
+		started:        time.Now(),
+		pf:             newPrefetchQueue(),
 	}
 }
 
@@ -163,8 +181,8 @@ func (f *sendReceiveFolder) isPinned(name string) bool {
 }
 
 func (f *sendReceiveFolder) setHydrating(name string, on bool) {
-	f.od.mut.Lock()
-	defer f.od.mut.Unlock()
+	f.od.hydratingMut.Lock()
+	defer f.od.hydratingMut.Unlock()
 	if on {
 		f.od.hydrating[name]++
 	} else if f.od.hydrating[name]--; f.od.hydrating[name] <= 0 {
@@ -173,8 +191,8 @@ func (f *sendReceiveFolder) setHydrating(name string, on bool) {
 }
 
 func (f *sendReceiveFolder) isHydrating(name string) bool {
-	f.od.mut.Lock()
-	defer f.od.mut.Unlock()
+	f.od.hydratingMut.Lock()
+	defer f.od.hydratingMut.Unlock()
 	_, ok := f.od.hydrating[name]
 	return ok
 }
@@ -449,6 +467,12 @@ func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.Fi
 }
 
 func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *os.File, kind hydrateKind) error {
+	// Checked again now that we hold the flight: the previous holder may
+	// have completed the file after our caller looked (it marks the file
+	// complete before releasing the flight).
+	if f.isComplete(dst) {
+		return nil
+	}
 	origin, bh, ok := hsm.ReadPlaceholderFile(dst)
 	if !ok {
 		return nil // already hydrated
