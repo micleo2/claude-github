@@ -45,7 +45,7 @@ type OnDemander interface {
 	OnDemandStatus(folder, prefix string) ([]OnDemandFileState, error)
 	OnDemandPin(folder, path string) error
 	OnDemandUnpin(folder, path string) error
-	OnDemandEvict(folder, path string) (int, error)
+	OnDemandEvict(folder, path string, verify bool) (int, error)
 	OnDemandHydrate(ctx context.Context, folder, path string) (int, error)
 }
 
@@ -296,7 +296,7 @@ func (m *model) OnDemandUnpin(folder, path string) error {
 	return nil
 }
 
-func (m *model) OnDemandEvict(folder, path string) (int, error) {
+func (m *model) OnDemandEvict(folder, path string, verify bool) (int, error) {
 	sr, err := m.onDemandFolder(folder)
 	if err != nil {
 		return 0, err
@@ -304,7 +304,7 @@ func (m *model) OnDemandEvict(folder, path string) (int, error) {
 	var n int
 	err = sr.doInSync(func(context.Context) error {
 		var err error
-		n, err = sr.evictPrefix(path)
+		n, err = sr.evictPrefix(path, verify)
 		return err
 	})
 	return n, err

@@ -53,7 +53,7 @@ func (s *service) postOnDemand(w http.ResponseWriter, r *http.Request) {
 	case "unpin":
 		err = od.OnDemandUnpin(folder, p)
 	case "evict":
-		n, err = od.OnDemandEvict(folder, p)
+		n, err = od.OnDemandEvict(folder, p, qs.Get("verify") == "true")
 	case "hydrate":
 		n, err = od.OnDemandHydrate(r.Context(), folder, p)
 	}

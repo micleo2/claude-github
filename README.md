@@ -69,7 +69,7 @@ A client folder is a normal send-receive folder with four extra settings:
 tether status ~/Docs/Photos      # local / pinned / online-only per file
 tether pin ~/Docs/Photos/2026    # download now and keep local
 tether unpin ~/Docs/Photos/2026
-tether evict ~/Docs/Videos       # free space; files stay listed and openable
+tether evict ~/Docs/Videos       # free space; files stay listed and openable (-verify re-reads them first)
 tether hydrate ~/Docs/Report.pdf # download now without pinning
 ```
 
@@ -88,9 +88,10 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 - **Remote changes:**
   - Pinned files are downloaded eagerly.
   - Other files become placeholders of the new version, even if they were local before.
-- **Eviction** turns a file back into a placeholder. It is refused when:
+- **Eviction** turns a file back into a placeholder, in batches of 1000 index updates (V8's 19,816 files take about
+  2 s). It is refused when:
   - the file is open (checked with a write lease), or
-  - its content differs from the index, or
+  - its size or modification time differs from the index (with `-verify`, any block), or
   - no other device holds that exact version.
 - **Sibling prefetch:** when an application opens a placeholder, the small placeholders in the same directory are
   downloaded in the background by a pool of workers.
@@ -99,8 +100,9 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
   - **Shared downloads:** an application opening a file that is being prefetched waits for that download rather than
     starting another.
   - **Effect:** `grep -r` over 300 online-only files with 20 ms round-trip time went from 9.2 s to 2.3 s.
-- **Cache budget:** when local content exceeds the budget, the least recently used unpinned files are evicted.
-  Prefetched files that nobody opened are evicted first.
+- **Cache budget:** when local content exceeds the budget, the least recently used unpinned files are evicted down
+  to 80% of the budget, so a folder near its budget isn't cleaned in many small rounds. Prefetched files that nobody
+  opened are evicted first.
 - **Failure handling:**
   - **Offline:** opening a placeholder fails with an error and never returns zeros. Local files keep working.
   - **Peer silently gone:** reads fail after `hydrationTimeoutS` (default 60 s).

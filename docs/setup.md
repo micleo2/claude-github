@@ -110,7 +110,7 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
 | Setting | Default | Meaning |
 |---|---|---|
 | `pinPatterns` | – | Paths that are always kept local (ignore-file syntax). `tether pin` adds these. |
-| `cacheBudget` | 0 (unlimited) | Evict least-recently-used unpinned files above this size (e.g. `20 GB`, `10 %`) |
+| `cacheBudget` | 0 (unlimited) | Above this size, evict least-recently-used unpinned files down to 80% of it (e.g. `20 GB`, `10 %`) |
 | `prefetchMaxFileKiB` | 256 | Sibling prefetch size limit; 0 disables prefetch |
 | `hydrationTimeoutS` | 60 | How long an open may wait for an unresponsive peer before failing with `EIO` |
 | `hydrationDenyExes` | – | Extra executables that may not trigger downloads (indexers are denied by default) |

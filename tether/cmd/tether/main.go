@@ -9,7 +9,8 @@
 //	tether status [PATH]   list files and whether they are local, pinned or online-only
 //	tether pin PATH        keep PATH (file or directory) local, downloading it now
 //	tether unpin PATH      let PATH be evicted again
-//	tether evict PATH      free the local copy of PATH now (it stays available online)
+//	tether evict PATH      free the local copy of PATH now (it stays available online;
+//	                       -verify re-reads it first)
 //	tether hydrate PATH    download PATH now without pinning it
 //
 // PATH may be inside a folder's on-demand view or its real path. The daemon
@@ -58,6 +59,7 @@ func main() {
 	home := flag.String("home", os.Getenv("STHOMEDIR"), "tether/syncthing home directory (contains config.xml)")
 	api := flag.String("api", os.Getenv("TETHER_API"), "API base URL, e.g. http://127.0.0.1:8384")
 	apikey := flag.String("apikey", os.Getenv("TETHER_APIKEY"), "API key")
+	verify := flag.Bool("verify", false, "evict: re-read and check every block first (default: size and modification time, as the scanner)")
 	flag.Usage = func() {
 		fmt.Fprintf(os.Stderr, "usage: tether [flags] status|pin|unpin|evict|hydrate [PATH]\n\nflags:\n")
 		flag.PrintDefaults()
@@ -74,7 +76,7 @@ func main() {
 
 	c, err := newClient(*home, *api, *apikey)
 	if err == nil {
-		err = run(c, cmd, arg)
+		err = run(c, cmd, arg, *verify)
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "tether:", err)
@@ -82,7 +84,7 @@ func main() {
 	}
 }
 
-func run(c *client, cmd, arg string) error {
+func run(c *client, cmd, arg string, verify bool) error {
 	folderID, rel, err := c.resolve(arg)
 	if err != nil {
 		return err
@@ -110,6 +112,9 @@ func run(c *client, cmd, arg string) error {
 		return nil
 	case "pin", "unpin", "evict", "hydrate":
 		q.Set("path", rel)
+		if cmd == "evict" && verify {
+			q.Set("verify", "true")
+		}
 		var res struct {
 			Files int    `json:"files"`
 			Error string `json:"error"`

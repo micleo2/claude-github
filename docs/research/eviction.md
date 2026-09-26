@@ -78,11 +78,29 @@ Mapped to the five eviction steps above.
 | # | Change | Why | Status |
 |---|---|---|---|
 | 1 | **Batch index updates** (step 5) | The per-file transaction and events were the whole cost | **Done** (ad8dc9e): 299 s → 2.2 s |
-| 2 | **Replace the re-hash with a clean-state check under the lease** (step 3). Compare the (dev, ino, size, mtime, ctime) recorded when the file was last hashed or downloaded; hash only racily clean files. Keep a full `--verify` mode. | Every other system compares a cheap state. Re-hashing costs a full read of every evicted byte: small for V8, a lot for large media. | Open. It needs a place to record the ctime *after* hydration, since our own xattr removal changes it. |
-| 3 | **Evict down to a low watermark** (e.g. 80% of the budget), with caps per run | Hysteresis as in cachefiles, CernVM-FS (50%), SeaDrive (70%) and RobinHood (95→93). Under a 30 MB budget, the V8 stress test produced 249 small eviction batches in about a minute. | Open |
-| 4 | **Track recency with an access sequence number** in the index instead of filesystem atime | atime depends on `relatime`/`noatime`, and prefetched files are marked with an artificial atime today | Open |
+| 2 | **Replace the re-hash with a clean-state check under the lease** (step 3). Keep a full `--verify` mode. | Every other system compares a cheap state. Re-hashing costs a full read of every evicted byte: small for V8, a lot for large media. | **Done:** size and mtime, as the scanner decides that a file is unchanged; `tether -verify evict` / `?verify=true` re-reads every block. See below. |
+| 3 | **Evict down to a low watermark** (80% of the budget) | Hysteresis as in cachefiles, CernVM-FS (50%), SeaDrive (70%) and RobinHood (95→93). Under a 30 MB budget, the V8 stress test produced 249 small eviction batches in about a minute. | **Done:** 249 → 48 batches for the same three passes, with no read errors. No per-run caps yet. |
+| 4 | **Track recency with an access sequence number** in the index instead of filesystem atime | atime depends on `relatime`/`noatime`, and prefetched files are marked with an artificial atime today | **Not applicable as designed:** see below. |
 | 5 | **Select candidates in one pass** (steps 1 and 2): one query per subtree, and skip busy files instead of failing | CernVM-FS, Apple, rclone and cachefiles all skip busy files and continue | Partly: bulk eviction already skips failures and continues |
 | 6 | **Keep treating "another device holds this version" as recorded state,** not a live query per file | Apple ("reported as uploaded") and RobinHood (`synchro`) do the same. git-annex's live checks are for a stronger guarantee than a sync hub needs. | As today |
+
+Notes on 2 and 4:
+
+- **2, the clean-state check.**
+  - **What it compares:** the index records no ctime, so the check compares size and mtime, which is the scanner's own
+    definition of unchanged.
+  - **Its limit:** a write that keeps both is also invisible to syncing, which would never upload it. Eviction without
+    `-verify` can drop such a change.
+  - **With `-verify`:** the block re-read catches it, refuses the eviction, and schedules the rescan that makes the
+    change visible (e2e `evict_verify_catches_invisible_change`).
+  - **Measured on V8:** evicting the whole tree took 1.96 s (2.2 s with re-hashing). Its small files are already in
+    the page cache, so eviction was mostly bookkeeping. The gain grows with large files and slow disks.
+  - **Stricter, later:** record the ctime after hydration and after each scan.
+- **4, an access sequence number.** CernVM-FS can keep one because, as a FUSE filesystem, it sees every access.
+  tether sees accesses only while a file is a placeholder: once it is local its mark is removed, so later reads raise
+  no events. Counting them would need an access mark on every local file, which is an event per read. Recency
+  therefore stays atime-based. Under `relatime` that resolves to about a day for files read repeatedly, and under
+  `noatime` it degrades to download order.
 
 Not recommended: asynchronous truncation or unlinking. In CernVM-FS it frees space off the critical path, but for
 tether the truncation is what makes the placeholder and must happen under the lease.

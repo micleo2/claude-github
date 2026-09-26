@@ -128,8 +128,8 @@ class Node:
         res = self.api("GET", f"/rest/ondemand/status?folder={FOLDER}&prefix={urllib.request.quote(prefix)}")
         return {f["name"]: f for f in res}
 
-    def od(self, op, path, expect_error=False):
-        return self.api("POST", f"/rest/ondemand/{op}?folder={FOLDER}&path={urllib.request.quote(path)}",
+    def od(self, op, path, expect_error=False, extra=""):
+        return self.api("POST", f"/rest/ondemand/{op}?folder={FOLDER}&path={urllib.request.quote(path)}{extra}",
                         expect_error=expect_error)
 
     def connected(self, other):
@@ -955,15 +955,52 @@ def cache_budget_evicts_lru(c):
     # it, so start with nothing else local.
     n.od("evict", "", expect_error=True)
     cfg = n.api("GET", f"/rest/config/folders/{FOLDER}")
-    cfg["cacheBudget"] = {"value": 12, "unit": "MB"}
+    # 3 x 5 MiB = 15.7 MB over a 14 MB budget: evicting the oldest reaches
+    # the low watermark (80 %, 11.2 MB), so the others stay.
+    cfg["cacheBudget"] = {"value": 14, "unit": "MB"}
     n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)
     for rel in names:
         assert n.view_sha(rel) == sha(FILES[rel])
         time.sleep(1.1)  # distinct atimes
     wait_for(lambda: n.is_placeholder(names[0]), 30, what="oldest file evicted")
+    time.sleep(2)
     assert not n.is_placeholder(names[1]) and not n.is_placeholder(names[2])
+    # Under a 12 MB budget the 10.5 MB left fit. Reading the oldest again
+    # (15.7 MB) must clean down to the watermark, 9.6 MB, not just under
+    # 12 MB: both less recently used files go.
+    cfg["cacheBudget"] = {"value": 12, "unit": "MB"}
+    n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)
+    assert n.view_sha(names[0]) == sha(FILES[names[0]])
+    wait_for(lambda: n.is_placeholder(names[1]) and n.is_placeholder(names[2]), 30, what="evicted to the low watermark")
+    assert not n.is_placeholder(names[0])
     cfg["cacheBudget"] = {"value": 0, "unit": ""}
     n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)
+
+
+@test
+def evict_verify_catches_invisible_change(c):
+    """A change that keeps size and mtime is invisible to the scanner; evict?verify=true re-reads and refuses it."""
+    n = c.c1
+    rel = "verify.bin"
+    FILES[rel] = random.Random(77).randbytes(256 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    assert n.view_sha(rel) == sha(FILES[rel])
+    wait_for(lambda: not n.db_file(rel)["local"]["localFlags"] & 128, what="hydration committed")
+    # Overwrite one byte in place and restore the mtime.
+    n.sh(f"f='{LOWER}/{rel}'; t=$(stat -c %y \"$f\"); printf X | dd of=\"$f\" bs=1 seek=100 conv=notrunc 2>/dev/null; "
+         f"touch -d \"$t\" \"$f\"")
+    res = n.od("evict", rel, expect_error=True, extra="&verify=true")
+    assert res["files"] == 0 and "modified" in res.get("error", ""), res
+    assert not n.is_placeholder(rel)
+    # The refusal schedules a rescan that hashes the file, so the change is
+    # no longer invisible: it reaches the server like any edit.
+    FILES[rel] = FILES[rel][:100] + b"X" + FILES[rel][101:]
+
+    def server_has_change():
+        with open(c.server.lower(rel), "rb") as f:
+            return sha(f.read()) == sha(FILES[rel])
+    wait_for(server_has_change, 60, what="server got the change found by verify")
 
 
 @test

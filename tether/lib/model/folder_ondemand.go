@@ -601,6 +601,7 @@ func (f *sendReceiveFolder) hydrateName(ctx context.Context, name string, kind h
 // placeholders and fixes the index (walker.walkPlaceholder).
 type evictBatch struct {
 	f       *sendReceiveFolder
+	verify  bool // re-read every block first (see verifyAgainstIndex)
 	pending []protocol.FileInfo
 	n       int
 	bytes   int64
@@ -608,8 +609,12 @@ type evictBatch struct {
 
 const evictBatchSize = 1000
 
+// cacheLowWaterPct is where cache budget eviction stops, in percent of the
+// budget.
+const cacheLowWaterPct = 80
+
 func (b *evictBatch) evict(name string) error {
-	fi, evicted, err := b.f.evictFile(name)
+	fi, evicted, err := b.f.evictFile(name, b.verify)
 	if err != nil || !evicted {
 		return err
 	}
@@ -640,7 +645,7 @@ func (b *evictBatch) log() {
 
 // evictFile turns name into a placeholder and returns its index entry, to be
 // committed by the caller. evicted is false if it already was one.
-func (f *sendReceiveFolder) evictFile(name string) (_ protocol.FileInfo, evicted bool, _ error) {
+func (f *sendReceiveFolder) evictFile(name string, verify bool) (_ protocol.FileInfo, evicted bool, _ error) {
 	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
 	switch {
 	case err != nil:
@@ -680,7 +685,7 @@ func (f *sendReceiveFolder) evictFile(name string) (_ protocol.FileInfo, evicted
 	}
 	defer hsm.Unlease(fd) //nolint:errcheck
 
-	if err := f.verifyAgainstIndex(fd, cur); err != nil {
+	if err := f.verifyAgainstIndex(fd, cur, verify); err != nil {
 		f.ScheduleForceRescan(name)
 		return cur, false, fmt.Errorf("%s: %w", name, err)
 	}
@@ -694,9 +699,14 @@ func (f *sendReceiveFolder) evictFile(name string) (_ protocol.FileInfo, evicted
 	return cur, true, nil
 }
 
-// verifyAgainstIndex checks that the file on disk is exactly what the index
-// says, block by block.
-func (f *sendReceiveFolder) verifyAgainstIndex(fd *os.File, cur protocol.FileInfo) error {
+// verifyAgainstIndex checks, under the eviction lease, that the file on disk
+// is what the index says: the same size and modification time, which is how
+// the scanner decides a file is unchanged (a write that keeps both is
+// invisible to syncing too). With full, every block is also re-read and
+// hashed. Other systems evict on a cheap clean state as well (Lustre's data
+// version, the Cloud Files in-sync bit); re-reading costs a full read of
+// every evicted byte. See docs/research/eviction.md.
+func (f *sendReceiveFolder) verifyAgainstIndex(fd *os.File, cur protocol.FileInfo, full bool) error {
 	st, err := fd.Stat()
 	if err != nil {
 		return err
@@ -706,6 +716,9 @@ func (f *sendReceiveFolder) verifyAgainstIndex(fd *os.File, cur protocol.FileInf
 	}
 	if _, _, ph := hsm.ReadPlaceholderFile(fd); ph {
 		return errNotLocal
+	}
+	if !full {
+		return nil
 	}
 	buf := make([]byte, cur.BlockSize())
 	for _, b := range cur.Blocks {
@@ -805,11 +818,15 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 	if used <= limit {
 		return nil
 	}
+	// Evict down to a low watermark rather than just under the budget, so
+	// that a folder near its budget is not cleaned in many small rounds
+	// (cachefiles, CernVM-FS, SeaDrive and RobinHood all do this).
+	target := limit / 100 * cacheLowWaterPct
 	slices.SortFunc(cands, func(a, b cand) int { return a.atime.Compare(b.atime) })
 	batch := &evictBatch{f: f}
 	defer batch.log()
 	for _, c := range cands {
-		if used <= limit {
+		if used <= target {
 			break
 		}
 		before := batch.n
@@ -890,8 +907,9 @@ func (f *sendReceiveFolder) onDemandStatus(prefix string) ([]OnDemandFileState, 
 	return res, err
 }
 
-// evictPrefix evicts all unpinned local files under prefix.
-func (f *sendReceiveFolder) evictPrefix(prefix string) (int, error) {
+// evictPrefix evicts all unpinned local files under prefix; verify re-reads
+// each one first (see verifyAgainstIndex).
+func (f *sendReceiveFolder) evictPrefix(prefix string, verify bool) (int, error) {
 	if err := f.commitHydrated(); err != nil {
 		return 0, err
 	}
@@ -905,7 +923,7 @@ func (f *sendReceiveFolder) evictPrefix(prefix string) (int, error) {
 	}); err != nil {
 		return 0, err
 	}
-	batch := &evictBatch{f: f}
+	batch := &evictBatch{f: f, verify: verify}
 	defer batch.log()
 	var errs []error
 	for _, name := range names {
