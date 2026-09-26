@@ -157,7 +157,8 @@ host's network). Both fail identically on unmodified upstream in this environmen
     `/sys/kernel/security/lsm` (Arch, Fedora and Debian 13 have it; Ubuntu doesn't by default) and Linux 6.8 or later.
   - **Without the bpf LSM,** placeholders read as zeros while tether is stopped: through `path`, through copies of the
     view held by containers or sandboxes, and from any process whose working directory was inside the view.
-  - **After a reboot,** the guard is gone until tether starts again.
+  - **After a reboot,** the guard is gone until tether starts again, unless an early boot unit installs it
+    (`tether-syncthing guard`; see [docs/setup.md](docs/setup.md)).
   - **Reads already waiting** for a download when the group closes are released by the kernel ("allow") and may return
     zeros or partial data. So may an open that races the shutdown by microseconds.
     - **A clean stop avoids this:** the monitor fails them with `EIO` first.

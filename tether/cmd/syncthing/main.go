@@ -47,6 +47,7 @@ import (
 	"github.com/syncthing/syncthing/lib/dialer"
 	"github.com/syncthing/syncthing/lib/events"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/hsm"
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/protocol"
@@ -137,6 +138,7 @@ type CLI struct {
 	Upgrade  upgradeCmd   `cmd:"" help:"Perform or check for upgrade, then exit"`
 	Version  versionCmd   `cmd:"" help:"Show current version, then exit"`
 	Debug    debugCmd     `cmd:"" help:"Various debugging commands"`
+	Guard    guardCmd     `cmd:"" help:"Install or remove the on-demand placeholder guard, then exit"`
 
 	InstallCompletions kongplete.InstallCompletions `cmd:"" help:"Print commands to install shell completions"`
 }
@@ -845,6 +847,25 @@ func exitCodeForUpgrade(err error) int {
 		return svcutil.ExitNoUpgradeAvailable.AsInt()
 	}
 	return svcutil.ExitError.AsInt()
+}
+
+// guardCmd installs the placeholder guard (hsm.InstallGuard) on its own,
+// for an early boot unit: the guard that tether installs when it starts is
+// not there between boot and then.
+type guardCmd struct {
+	Dir    string `default:"/run/tether/guard" placeholder:"PATH" help:"bpffs directory that pins the guard"`
+	Remove bool   `help:"Remove the guard pinned in --dir instead"`
+}
+
+func (c guardCmd) Run() error {
+	if c.Remove {
+		return hsm.RemoveGuard(c.Dir)
+	}
+	if err := hsm.InstallGuard(c.Dir); err != nil {
+		return err
+	}
+	fmt.Println("Placeholder guard active, pinned in", c.Dir)
+	return nil
 }
 
 type versionCmd struct{}

@@ -181,8 +181,10 @@ service's restarts):
 
 **Still open:**
 
-- **Boot:** until tether starts after a reboot, nothing guards placeholders. An early root unit that loads the guard
-  would close that window.
+- ~~**Boot:** until tether starts after a reboot, nothing guards placeholders.~~ `tether-syncthing guard --dir
+  /run/tether/guard` installs the guard on its own, and [setup.md](../setup.md) §3 has an early system unit that runs
+  it before `sysinit.target`. Checked live: with only that guard attached and tether stopped, a placeholder read fails
+  with `EIO`.
 - **D:** adopt upstream `FAN_CONTROL_FD` when it lands; it would replace the EIO sweep with retries.
 - **`chattr +i`** is not a viable interim step. An immutable file can't be renamed, deleted or chmod'ed, and tether
   supports those operations on placeholders.

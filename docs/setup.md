@@ -64,6 +64,29 @@ tether-syncthing serve --home ~/.local/state/tether-client --no-browser
   FileDescriptorStoreMax=1
   NotifyAccess=main
   ```
+- **Guard placeholders from boot on** (optional, needs the bpf LSM). Until the service starts after a reboot, nothing
+  stops programs from reading online-only files as zeros; a root backup job, for example. A system unit can install
+  the guard early:
+
+  ```ini
+  # /etc/systemd/system/tether-guard.service
+  [Unit]
+  Description=tether placeholder guard (until tether itself starts)
+  DefaultDependencies=no
+  After=local-fs.target
+  Before=sysinit.target
+
+  [Service]
+  Type=oneshot
+  RemainAfterExit=yes
+  ExecStart=/usr/local/bin/tether-syncthing guard --dir /run/tether/guard
+
+  [Install]
+  WantedBy=sysinit.target
+  ```
+
+  Enable it with `sudo systemctl enable tether-guard`. It is the same program the service installs, pinned separately,
+  and it stays until shutdown.
 - **Coexisting with Syncthing:** if a normal Syncthing already runs on this machine, give tether other ports. Set the
   GUI address in the config (*Settings → GUI*, or `PATCH /rest/config/gui`) rather than with `--gui-address`, which is
   not saved, so the `tether` CLI finds the right daemon. Set the sync port in `listenAddresses`.
@@ -136,7 +159,7 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
   (`bpf` listed in `/sys/kernel/security/lsm`); the log says "Placeholder guard active" or explains why not. Without
   it, placeholders read as zeros while tether is stopped. The guard stays after the service stops. To remove it (e.g.
   when uninstalling): `rm <data dir>/guard/placeholder-guard && umount <data dir>/guard`. A reboot removes it until
-  tether starts. See [research/daemon-restart.md](research/daemon-restart.md).
+  tether starts, unless the boot unit in §3 installs it. See [research/daemon-restart.md](research/daemon-restart.md).
 - **Privileges.** With `setcap`, anyone who can run that binary gets `CAP_SYS_ADMIN` in it. The planned fix is a small
   privileged helper plus an unprivileged per-user daemon.
 - **Settings UI.** The GUI has no dedicated on-demand controls. The fields should show up in the folder's *Advanced*
