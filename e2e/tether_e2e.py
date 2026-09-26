@@ -343,6 +343,88 @@ def sparse_aware_copy(c):
     assert not c.c2.is_placeholder("big.bin")
 
 
+# Every way we know of to copy or read a file, including those that trust
+# the filesystem's view of holes (SEEK_DATA, FIEMAP) and copy in the kernel
+# (copy_file_range, sendfile). Started at once, in the background.
+COPIERS = {
+    "cat": "cat {src} > {out}",
+    "cp": "cp {src} {out}",
+    "cp --sparse=always": "cp --sparse=always {src} {out}",
+    "tar -S": "tar -S -cf - -C $(dirname {src}) $(basename {src}) | tar -xOf - > {out}",
+    "dd conv=sparse": "dd if={src} of={out} bs=1M conv=sparse status=none",
+    "seekdata": "/opt/tether/probe seekdata {src} > {out}.sha",
+    "fiemap": "/opt/tether/probe fiemap {src} > {out}.sha",
+    # The copy goes to the view's filesystem, outside the folder: across
+    # filesystems copy_file_range fails (EXDEV) and tools fall back to read.
+    "copy_file_range": "mkdir -p /data/probe-tmp && TMPDIR=/data/probe-tmp /opt/tether/probe copyrange {src} > {out}.sha",
+    "sendfile": "/opt/tether/probe sendfile {src} > {out}.sha",
+    "mmap": "/opt/tether/probe mmap {src} > {out}.sha",
+}
+
+
+def run_copiers(n, rel, tag):
+    """Copies VIEW/rel with every copier at once; returns {copier: sha256}."""
+    src = f"'{VIEW}/{rel}'"
+    parts = [f"rm -rf /tmp/cp-{tag}; mkdir -p /tmp/cp-{tag}"]
+    for i, cmd in enumerate(COPIERS.values()):
+        out = f"/tmp/cp-{tag}/{i}"
+        parts.append("(" + cmd.format(src=src, out=out) + f") 2>{out}.err &")
+    parts.append("wait")
+    for i in range(len(COPIERS)):
+        out = f"/tmp/cp-{tag}/{i}"
+        parts.append(f"if [ -s {out}.sha ]; then cat {out}.sha; elif [ -f {out} ]; then sha256sum {out} | cut -d' ' -f1; "
+                     f"else echo MISSING:$(head -c 200 {out}.err | tr -s ' \\n' '__'); fi")
+    lines = n.sh("\n".join(parts), timeout=300).stdout.split()
+    return dict(zip(COPIERS, lines))
+
+
+def assert_copies(got, want, when):
+    bad = {k: v for k, v in got.items() if v != want}
+    assert len(got) == len(COPIERS) and not bad, f"{when}: wrong copies: {bad} ({len(got)} copiers ran)"
+
+
+@test
+def copiers_never_see_zeros(c):
+    """Copies taken while a file downloads, is prefetched, or is being made durable always match the server."""
+    n = c.c2
+    # 1. While the download is in progress over a slow link.
+    rel = "copiers/big.bin"
+    FILES[rel] = random.Random(90).randbytes(32 * MiB)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    with SlowLink(c, 10):
+        t0 = time.time()
+        got = run_copiers(n, rel, "download")
+        took = time.time() - t0
+    assert_copies(got, sha(FILES[rel]), "during the download")
+    print(f"      {len(COPIERS)} copiers during a {took:.1f}s download: all correct")
+
+    # 2. While the file is being prefetched as a sibling of one just opened.
+    names = make_dir(c, "copiers/pf", 20, 200_000, 91)
+    c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=copiers/pf")
+    for r in names:
+        c.wait_placeholder(n, r)
+    with SlowLink(c, 10):
+        n.sh(f"cat '{VIEW}/{names[0]}' > /dev/null")
+        got = {r: run_copiers(n, r, f"pf{i}") for i, r in enumerate(names[-3:])}
+    for r, g in got.items():
+        assert_copies(g, sha(FILES[r]), f"while {r} was prefetched")
+
+    # 3. After the content is complete, before it is durable (still a placeholder on disk).
+    m = c.c1
+    restart_with(m, ["TETHER_FINISH_DELAY=3s"])
+    try:
+        rel = "copiers/durable.bin"
+        FILES[rel] = random.Random(92).randbytes(3 * MiB)
+        c.write_server(rel, FILES[rel])
+        c.wait_placeholder(m, rel)
+        m.sh(f"cat '{VIEW}/{rel}' > /dev/null")
+        assert m.is_placeholder(rel), "expected to be inside the durability window"
+        assert_copies(run_copiers(m, rel, "durable"), sha(FILES[rel]), "while being made durable")
+    finally:
+        restart_with(m)
+
+
 @test
 def concurrent_readers(c):
     """Several processes opening the same placeholder at once all get the content."""
