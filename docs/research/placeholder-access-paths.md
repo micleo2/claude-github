@@ -229,6 +229,8 @@ What the implementation found beyond the spikes:
 
 ## 9. Implementation notes (option 6)
 
+The full survey behind this is in [daemon-restart.md](daemon-restart.md).
+
 Prior art: the group lives while any process holds it, like `/dev/fuse` in FUSE's fd-store recovery pattern and in
 Nydus's failover. Upstream's `FAN_CONTROL_FD` (restartable permission events) would re-queue in-flight events, but it is
 unmerged as of September 2026.

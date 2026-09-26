@@ -17,6 +17,8 @@ program reads a normal local file at native speed.
 - **Small-file performance survey:** [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md)
 - **Placeholders seen from other mount namespaces (survey, spikes, options):**
   [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md)
+- **Eviction (survey and measurements):** [docs/research/eviction.md](docs/research/eviction.md)
+- **Keeping placeholders guarded across daemon restarts:** [docs/research/daemon-restart.md](docs/research/daemon-restart.md)
 - **Next step, crawler-aware prefetch:** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
 
 Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` for the CLI).
