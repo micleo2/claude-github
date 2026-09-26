@@ -20,7 +20,7 @@ program reads a normal local file at native speed.
 - **Eviction (survey and measurements):** [docs/research/eviction.md](docs/research/eviction.md)
 - **Keeping placeholders guarded across daemon restarts:** [docs/research/daemon-restart.md](docs/research/daemon-restart.md)
 - **Stale placeholders and failed hydrations (survey, churn stress test):** [docs/research/stale-placeholders.md](docs/research/stale-placeholders.md)
-- **Next step, crawler-aware prefetch:** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
+- **Prefetch ahead of tree walks (design, measurements):** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
 
 Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` for the CLI).
 
@@ -31,6 +31,7 @@ Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` fo
 | `tether/` | The Syncthing fork (from v2.1.5; see `tether/UPSTREAM`) |
 | `tether/lib/hsm/` | fanotify listener with per-placeholder inode marks, bind-mount views, placeholder xattrs, lease-based eviction helpers |
 | `tether/lib/model/folder_ondemand.go` | Placeholder creation, hydration from peers, eviction, pins, cache budget |
+| `tether/lib/model/folder_prefetch.go`, `folder_crawl.go` | Sibling prefetch; prefetch ahead of tree walks |
 | `tether/lib/model/model_ondemand.go` | Listener lifecycle, hydration policy, `/rest/ondemand/*` backing |
 | `tether/cmd/tether/` | `tether` CLI (`status`, `pin`, `unpin`, `evict`, `hydrate` by path) |
 | `e2e/` | Multi-node Docker end-to-end suite |
@@ -97,10 +98,21 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 - **Sibling prefetch:** when an application opens a placeholder, the small placeholders in the same directory are
   downloaded in the background by a pool of workers.
   - **Limits:** direct children only, files ≤ `prefetchMaxFileKiB` (default 256; 0 disables), `prefetchConcurrency`
-    workers (default 16), each directory at most once per 30 s.
+    workers (default 64), each directory at most once per 30 s.
   - **Shared downloads:** an application opening a file that is being prefetched waits for that download rather than
     starting another.
   - **Effect:** `grep -r` over 300 online-only files with 20 ms round-trip time went from 9.2 s to 2.3 s.
+- **Prefetch ahead of tree walks:** a process group that opens placeholders in 4 directories within 2 s is taken to be
+  walking the tree (`grep -r`, `find -exec`, a build). The placeholders it will open next are downloaded ahead of it,
+  in the order the filesystem lists directories, which is the order `find` and `grep -r` use.
+  - **Tracking the walker:** files fetched for it stay marked until their first open, which tells tether how far it
+    has got.
+  - **Limits:** files ≤ `crawlPrefetchMaxFileKiB` (default 1024; 0 disables), an adaptive window of 16–1024 files
+    ahead, at most 256 MiB (or a tenth of the cache budget) downloaded and not yet opened, `crawlPrefetchMaxMiB`
+    (default 1024) per walk.
+  - **Never triggered by** `find`, `du`, `ls -R` or indexers, which don't open file content or are denied.
+  - **Effect:** `grep -r` over 600 directories with one file each, 20 ms RTT: 17.4 s → 1.1 s. See
+    [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md).
 - **Cache budget:** when local content exceeds the budget, the least recently used unpinned files are evicted down
   to 80% of the budget, so a folder near its budget isn't cleaned in many small rounds. Prefetched files that nobody
   opened are evicted first.
@@ -123,7 +135,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 46 end-to-end tests, ~6 min
+sudo e2e/run.sh                          # 49 end-to-end tests, ~7 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -182,9 +194,10 @@ host's network). Both fail identically on unmodified upstream in this environmen
   durable in the background; see [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md) §4.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
-- **The first file opened in each directory still waits one full fetch.** Its siblings are prefetched, but tools that
-  touch one file per directory get no benefit. Deeper prefetch (crawler detection, access history) is future work; see
-  [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md).
+- **Prefetch is tuned for sequential walkers.** Ahead-of-walk prediction follows directory order, which is what
+  `find` and `grep -r` use. Multi-threaded walkers (`rg`, `git status`) and filtering ones (`grep -r --include`) are not
+  measured yet; a filtering walker may cost up to `crawlPrefetchMaxMiB` of files it never opens. Interactive opens and
+  the first few files of a walk still wait one fetch each.
 - **A metadata-only change to a placeholder can win a conflict against a content change.** This needs the content
   change to carry an *older* mtime. The winning version's content then exists nowhere. The losing content is kept as a
   conflict copy, and the file cannot be hydrated until someone writes it again.

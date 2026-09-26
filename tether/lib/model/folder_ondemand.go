@@ -68,7 +68,8 @@ type onDemandState struct {
 	maintenancePending atomic.Bool
 	started            time.Time
 
-	pf prefetchQueue
+	pf    prefetchQueue
+	crawl crawlTracker
 
 	mut     sync.Mutex
 	pinKey  string
@@ -412,9 +413,10 @@ var _ scanner.PlaceholderChecker = placeholderChecker{}
 type hydrateKind int
 
 const (
-	hydrateDemand   hydrateKind = iota // an application opened it and is waiting
-	hydrateExplicit                    // pin or API request
-	hydratePrefetch                    // speculative, from the prefetch queue
+	hydrateDemand    hydrateKind = iota // an application opened it and is waiting
+	hydrateExplicit                     // pin or API request
+	hydratePrefetch                     // speculative, from the prefetch queue
+	hydrateLookahead                    // speculative, ahead of a tree walk (folder_crawl.go)
 )
 
 type hydrationFlight struct {
@@ -426,6 +428,10 @@ type hydrationFlight struct {
 // dst, which may be the fanotify event fd or a file opened through the
 // folder path. On success the file is a normal local file. Concurrent
 // hydrations of the same name share one download.
+func (k hydrateKind) speculative() bool {
+	return k == hydratePrefetch || k == hydrateLookahead
+}
+
 func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.File, kind hydrateKind) error {
 	for attempt := 0; attempt < 3; attempt++ {
 		if f.isComplete(dst) {
@@ -463,7 +469,7 @@ func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.Fi
 		case <-ctx.Done():
 			return ctx.Err()
 		}
-		if kind == hydratePrefetch {
+		if kind.speculative() {
 			return nil
 		}
 	}
@@ -668,7 +674,7 @@ func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src
 	// budget evicts them first if nobody uses them, and the first real read
 	// refreshes it (relatime updates an atime older than mtime).
 	atime := time.Now()
-	if kind == hydratePrefetch {
+	if kind.speculative() {
 		atime = time.Unix(1, 0)
 	}
 	// What the application may stat meanwhile. From here on, a write by
@@ -689,7 +695,13 @@ func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src
 		if err := hsm.Finish(fd, mtime, atime); err != nil {
 			return err
 		}
-		f.model.hsmUnmark(fd)
+		if kind == hydrateLookahead && f.crawlExpects(name) {
+			// Marked until first opened, which tells the tree walk
+			// tracker that the walker got here (hsmHandler.OpenedMarked).
+			f.model.hsmKeepMarked(fd, f.folderID, name)
+		} else {
+			f.model.hsmUnmark(fd)
+		}
 		return nil
 	}
 	f.sl.Debug("Hydrated file", slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
@@ -1333,6 +1345,7 @@ func (f *sendReceiveFolder) onDemandLoop(ctx context.Context) {
 	for range max(f.PrefetchConcurrency, 1) {
 		go f.prefetchWorker(ctx)
 	}
+	go f.crawlJanitor(ctx)
 	t := time.NewTicker(onDemandMaintenanceInterval)
 	defer t.Stop()
 	for {

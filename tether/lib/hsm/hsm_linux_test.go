@@ -982,3 +982,78 @@ func TestWriteAfterComplete(t *testing.T) {
 		}
 	})
 }
+
+type observingHandler struct {
+	mapHandler
+	mu       sync.Mutex
+	accessor []int
+	opened   map[[2]uint64][]int
+}
+
+func (h *observingHandler) Hydrate(ctx context.Context, folder, name string, f *os.File) error {
+	pid, _ := Accessor(ctx)
+	h.mu.Lock()
+	h.accessor = append(h.accessor, pid)
+	h.mu.Unlock()
+	return h.mapHandler.Hydrate(ctx, folder, name, f)
+}
+
+func (h *observingHandler) OpenedMarked(key [2]uint64, pid int) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.opened[key] = append(h.opened[key], pid)
+}
+
+// A handler learns who is waiting for a hydration, and when a file it kept
+// marked after hydrating it is first opened.
+func TestAccessorAndOpenedMarked(t *testing.T) {
+	h := &observingHandler{mapHandler: mapHandler{data: map[string][]byte{"f/p": []byte("content")}}, opened: map[[2]uint64][]int{}}
+	lower, view, l := setup(t, h, nil)
+	placeholder(t, l, lower, "p", 7)
+	if got, err := os.ReadFile(filepath.Join(view, "p")); err != nil || string(got) != "content" {
+		t.Fatal(got, err)
+	}
+	if len(h.accessor) != 1 || h.accessor[0] != os.Getpid() {
+		t.Fatalf("accessor %v, want [%d]", h.accessor, os.Getpid())
+	}
+
+	// A local file kept marked, as after a prefetch.
+	path := filepath.Join(lower, "kept")
+	if err := os.WriteFile(path, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	f, _ := os.Open(path)
+	key, _ := Key(f)
+	if err := l.markMask(int(f.Fd()), eventMask); err != nil {
+		t.Fatal(err)
+	}
+	f.Close() // the listener sees this open, but f was not marked yet
+	h.mu.Lock()
+	delete(h.opened, key)
+	h.mu.Unlock()
+
+	cmd := exec.Command("cat", filepath.Join(view, "kept"))
+	if out, err := cmd.Output(); err != nil || string(out) != "x" {
+		t.Fatal(string(out), err)
+	}
+	os.ReadFile(filepath.Join(view, "kept")) // unmarked by now: not reported
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if got := h.opened[key]; len(got) != 1 || got[0] != cmd.Process.Pid {
+		t.Fatalf("OpenedMarked calls %v, want [%d]", got, cmd.Process.Pid)
+	}
+	if h.calls.Load() != 1 {
+		t.Fatalf("a local file was hydrated")
+	}
+}
+
+// UnmarkLocal leaves placeholders marked.
+func TestUnmarkLocalKeepsPlaceholders(t *testing.T) {
+	h := &mapHandler{data: map[string][]byte{"f/p": []byte("content")}}
+	lower, view, l := setup(t, h, nil)
+	placeholder(t, l, lower, "p", 7)
+	l.UnmarkLocal("f", "p")
+	if got, err := os.ReadFile(filepath.Join(view, "p")); err != nil || string(got) != "content" {
+		t.Fatalf("placeholder lost its mark: %q %v", got, err)
+	}
+}

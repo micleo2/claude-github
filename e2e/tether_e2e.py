@@ -949,6 +949,75 @@ def prefetch_under_latency(c):
     assert results["on"] * 2 < results["off"], results
 
 
+def make_tree(c, root, dirs, sub, size, seed):
+    """dirs x sub directories with one file each: sibling prefetch has nothing to do."""
+    rnd = random.Random(seed)
+    names = []
+    for d in range(dirs):
+        for e in range(sub):
+            rel = f"{root}/d{d:02}/e{e:02}/f.txt"
+            FILES[rel] = rnd.randbytes(size)
+            path = c.server.lower(rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "wb") as f:
+                f.write(FILES[rel])
+            names.append(rel)
+    c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={root}")
+    return names
+
+
+def placeholders(n, rels):
+    return sum(n.is_placeholder(r) for r in rels)
+
+
+@test
+def crawl_prefetch_under_latency(c):
+    """grep -r over one file per directory, 20 ms RTT: prefetch ahead of the walk vs sibling prefetch only."""
+    n = c.c2
+    dirs, sub = (12, 10) if not SLOW else (30, 20)
+    results = {}
+    for label, kib in (("off", 0), ("on", 1024)):
+        set_folder(n, crawlPrefetchMaxFileKiB=kib)
+        root = f"crawl-{label}"
+        names = make_tree(c, root, dirs, sub, 600, 70 if label == "off" else 71)
+        wait_for(lambda: n.is_placeholder(names[-1]) and c.synced(n, names[-1]), 120, what=f"{root} placeholders")
+        # Walks that never open content download nothing, and do not count as crawling.
+        n.sh(f"find '{VIEW}/{root}' -type f | wc -l; du -a --apparent-size '{VIEW}/{root}' >/dev/null; ls -lR '{VIEW}/{root}' >/dev/null")
+        time.sleep(1)
+        assert placeholders(n, names) == len(names), "metadata walks downloaded content"
+        with SlowLink(c, 10):
+            t0 = time.time()
+            out = n.sh(f"grep -rl --binary-files=text . '{VIEW}/{root}' | wc -l").stdout.strip()
+            results[label] = time.time() - t0
+        assert out == str(len(names)), out
+        for rel in names[:: max(1, len(names) // 20)]:
+            assert n.view_sha(rel) == sha(FILES[rel]), rel
+    set_folder(n, crawlPrefetchMaxFileKiB=1024)
+    print(f"      grep -r over {dirs * sub} directories with one file each, 20 ms RTT: ahead-of-walk prefetch "
+          f"off {results['off']:.1f}s, on {results['on']:.1f}s ({results['off'] / results['on']:.1f}x)")
+    assert results["on"] * 2 < results["off"], results
+
+
+@test
+def crawl_prefetch_byte_cap(c):
+    """A walker that stops early costs at most crawlPrefetchMaxMiB; content stays right."""
+    n = c.c1
+    names = make_tree(c, "crawlcap", 40, 1, 256 * 1024, 72)
+    wait_for(lambda: n.is_placeholder(names[-1]) and c.synced(n, names[-1]), 60, what="crawlcap placeholders")
+    set_folder(n, crawlPrefetchMaxMiB=1)
+    try:
+        # Opens four directories' files, then idles with its process group alive.
+        paths = " ".join(f"'{VIEW}/{r}'" for r in names[:4])
+        n.sh(f"cat {paths} >/dev/null; sleep 4")
+        local = len(names) - placeholders(n, names)
+        # 4 opened, then 1 MiB = 4 files ahead.
+        assert 4 < local <= 8, f"{local} files local"
+        for rel in names[:8]:
+            assert n.view_sha(rel) == sha(FILES[rel]), rel
+    finally:
+        set_folder(n, crawlPrefetchMaxMiB=1024)
+
+
 @test
 def cache_budget_evicts_lru(c):
     n = c.c2

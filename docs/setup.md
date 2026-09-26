@@ -148,10 +148,12 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
 | `pinPatterns` | – | Paths that are always kept local (ignore-file syntax). `tether pin` adds these. |
 | `cacheBudget` | 0 (unlimited) | Above this size, evict least-recently-used unpinned files down to 80% of it (e.g. `20 GB`, `10 %`) |
 | `prefetchMaxFileKiB` | 256 | Sibling prefetch size limit; 0 disables prefetch |
+| `crawlPrefetchMaxFileKiB` | 1024 | Size limit for prefetch ahead of tree walks (`grep -r`, `find -exec`); 0 disables it |
+| `crawlPrefetchMaxMiB` | 1024 | Most a single tree walk may prefetch |
 | `hydrationTimeoutS` | 60 | How long an open may wait for an unresponsive peer before failing with `EIO` |
 | `hydrationDenyExes` | – | Extra executables that may not trigger downloads (indexers are denied by default) |
 
-`prefetchConcurrency` (default 16) also exists, but changing it restarts the folder.
+`prefetchConcurrency` (default 64) also exists, but changing it restarts the folder.
 
 ## Known rough edges
 

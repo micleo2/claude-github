@@ -102,7 +102,13 @@ type FolderConfiguration struct {
 	// When an application opens a placeholder, its sibling placeholders up to
 	// this size are downloaded in the background (0 disables).
 	PrefetchMaxFileKiB  int `json:"prefetchMaxFileKiB" xml:"prefetchMaxFileKiB" default:"256" restart:"false"`
-	PrefetchConcurrency int `json:"prefetchConcurrency" xml:"prefetchConcurrency" default:"16"`
+	PrefetchConcurrency int `json:"prefetchConcurrency" xml:"prefetchConcurrency" default:"64"`
+	// Ahead of an application walking the tree (grep -r, find -exec, a
+	// build), the placeholders it will open next, up to this size, are
+	// downloaded in the background (0 disables), up to CrawlPrefetchMaxMiB
+	// per walk.
+	CrawlPrefetchMaxFileKiB int `json:"crawlPrefetchMaxFileKiB" xml:"crawlPrefetchMaxFileKiB" default:"1024" restart:"false"`
+	CrawlPrefetchMaxMiB     int `json:"crawlPrefetchMaxMiB" xml:"crawlPrefetchMaxMiB" default:"1024" restart:"false"`
 
 	// Legacy deprecated
 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.

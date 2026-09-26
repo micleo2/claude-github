@@ -55,6 +55,7 @@ func (*Listener) Evict(string, string, int64, string, []byte, func(*os.File) err
 	return errUnsupported
 }
 func (*Listener) Unmark(*os.File)                 {}
+func (*Listener) UnmarkLocal(string, string)      {}
 func (*Listener) MarkTree(string) (int, error)    { return 0, errUnsupported }
 func (*Listener) Serve(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
 

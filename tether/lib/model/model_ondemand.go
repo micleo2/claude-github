@@ -67,7 +67,18 @@ type modelOnDemand struct {
 
 	// Per folder ID, across folder restarts (see onDemandState).
 	hydrations map[string]*hydrationState
+
+	// Files prefetched ahead of a tree walk, kept marked until opened.
+	keptMut sync.Mutex
+	kept    map[[2]uint64]keptMark
 }
+
+type keptMark struct{ folder, name string }
+
+// maxKeptMarks bounds the files kept marked after a lookahead prefetch.
+// Beyond it, they are unmarked at once and the walk tracker does not see
+// them opened.
+const maxKeptMarks = 1 << 16
 
 // hydrationState returns the hydration bookkeeping of the folder, which
 // every instance of it shares.
@@ -108,7 +119,25 @@ func (h hsmHandler) Hydrate(ctx context.Context, folder, name string, f *os.File
 	if err != nil {
 		return err
 	}
+	if pid, ok := hsm.Accessor(ctx); ok {
+		sr.crawlTouch(pid, name, sr.isComplete(f))
+	}
 	return sr.hydrate(ctx, name, f, hydrateDemand)
+}
+
+// OpenedMarked is called when a file we kept marked after prefetching it
+// ahead of a tree walk is opened (see hsmKeepMarked).
+func (h hsmHandler) OpenedMarked(key [2]uint64, pid int) {
+	h.m.od.keptMut.Lock()
+	k, ok := h.m.od.kept[key]
+	delete(h.m.od.kept, key)
+	h.m.od.keptMut.Unlock()
+	if !ok {
+		return
+	}
+	if sr, err := h.m.onDemandFolder(k.folder); err == nil {
+		sr.crawlTouch(pid, k.name, true)
+	}
 }
 
 func (m *model) hydrationPolicy(folder string, _ int, exe string) syscall.Errno {
@@ -201,6 +230,40 @@ func (m *model) hsmUnmark(fd *os.File) {
 	m.od.mut.Unlock()
 	if l != nil {
 		l.Unmark(fd)
+	}
+}
+
+// hsmKeepMarked keeps the mark of a hydrated file, so that its first open
+// is reported to OpenedMarked (and the mark removed then).
+func (m *model) hsmKeepMarked(fd *os.File, folder, name string) {
+	key, ok := hsm.Key(fd)
+	m.od.keptMut.Lock()
+	if ok && len(m.od.kept) < maxKeptMarks {
+		if m.od.kept == nil {
+			m.od.kept = make(map[[2]uint64]keptMark)
+		}
+		m.od.kept[key] = keptMark{folder, name}
+		m.od.keptMut.Unlock()
+		return
+	}
+	m.od.keptMut.Unlock()
+	m.hsmUnmark(fd)
+}
+
+// hsmUnmarkUnused removes the mark of a file we kept marked (see
+// hsmKeepMarked) that nobody opened.
+func (m *model) hsmUnmarkUnused(folder, name string, key [2]uint64) {
+	m.od.keptMut.Lock()
+	k, ok := m.od.kept[key]
+	if ok && k.folder == folder && k.name == name {
+		delete(m.od.kept, key)
+	}
+	m.od.keptMut.Unlock()
+	m.od.mut.Lock()
+	l := m.od.l
+	m.od.mut.Unlock()
+	if l != nil {
+		l.UnmarkLocal(folder, name)
 	}
 }
 

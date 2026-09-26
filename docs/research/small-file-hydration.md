@@ -204,7 +204,9 @@ follows restoring the recorded mtime, and any later write changes it.
   read is 9.3–10.2 s with sibling prefetch and 12.9–14.5 s without it, so prefetch pays off on a LAN too.
 
 The remaining per-file cost is the fetch itself, and the first file of each directory still waits for a full round
-trip. Crawler-aware prefetch ([docs/design/crawler-prefetch.md](../design/crawler-prefetch.md)) is the next lever.
+trip. Prefetch ahead of tree walks ([docs/design/crawler-prefetch.md](../design/crawler-prefetch.md)) addresses
+that: on the e2e cluster, `grep -r` over 600 directories with one file each at 20 ms RTT went from 17.4 s to 1.1 s.
+It has not been measured on V8 yet.
 
 ## Sources
 

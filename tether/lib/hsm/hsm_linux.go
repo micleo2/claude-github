@@ -512,6 +512,33 @@ func (l *Listener) Unmark(f *os.File) {
 	l.unmark(int(f.Fd()))
 }
 
+// UnmarkLocal removes the mark of the file name in folder, unless it is a
+// placeholder or about to become one. The file is held open meanwhile, so
+// an eviction cannot take its lease and turn it into a placeholder between
+// the check and the unmark.
+func (l *Listener) UnmarkLocal(folder, name string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, v := range l.views {
+		if v.Folder != folder {
+			continue
+		}
+		fd, err := unix.Openat(v.private, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC|unix.O_NOATIME, 0)
+		if errors.Is(err, unix.EPERM) { // O_NOATIME needs ownership
+			fd, err = unix.Openat(v.private, name, unix.O_RDONLY|unix.O_NOFOLLOW|unix.O_NONBLOCK|unix.O_CLOEXEC, 0)
+		}
+		if err != nil {
+			return
+		}
+		f := os.NewFile(uintptr(fd), name)
+		if !IsVirtual(f) {
+			l.unmarkLocal(f)
+		}
+		f.Close()
+		return
+	}
+}
+
 func (l *Listener) unmark(fd int) {
 	_ = unix.FanotifyMark(l.fd, unix.FAN_MARK_REMOVE, eventMask, fd, "")
 }
@@ -660,6 +687,11 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		return 0
 	}
 	if !IsVirtual(f) {
+		if obs, ok := l.handler.(OpenObserver); ok {
+			if key, ok := Key(f); ok {
+				obs.OpenedMarked(key, pid)
+			}
+		}
 		l.unmarkLocal(f)
 		return 0
 	}
@@ -689,7 +721,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		fl = prev.(*flight)
 		<-fl.done
 	} else {
-		fl.err = l.hydrateVia(ctx, v, name, &st)
+		fl.err = l.hydrateVia(withAccessor(ctx, pid), v, name, &st)
 		l.flights.Delete(key)
 		close(fl.done)
 	}

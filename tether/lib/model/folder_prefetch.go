@@ -18,6 +18,7 @@ package model
 import (
 	"context"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -38,11 +39,17 @@ const (
 	prefetchDirInterval = 30 * time.Second
 )
 
+// prefetchQueue holds speculative downloads. Siblings of opened files come
+// first: they are what the application needs next. Then one lane per tree
+// walker (folder_crawl.go), served round-robin.
 type prefetchQueue struct {
 	mut     sync.Mutex
 	queue   []string
 	queued  map[string]struct{}
 	dirSeen map[string]time.Time
+	lanes   map[int][]string // by crawl actor
+	order   []int            // lanes, round-robin
+	next    int
 	wake    chan struct{}
 }
 
@@ -50,6 +57,7 @@ func newPrefetchQueue() prefetchQueue {
 	return prefetchQueue{
 		queued:  make(map[string]struct{}),
 		dirSeen: make(map[string]time.Time),
+		lanes:   make(map[int][]string),
 		wake:    make(chan struct{}, 1),
 	}
 }
@@ -75,17 +83,30 @@ func (q *prefetchQueue) claimDir(dir string) bool {
 }
 
 func (q *prefetchQueue) push(names []string) int {
+	return q.pushLane(0, names)
+}
+
+// pushLane queues names in the lane of a crawl actor, or with the siblings
+// for lane 0. Names already queued anywhere are skipped.
+func (q *prefetchQueue) pushLane(lane int, names []string) int {
 	q.mut.Lock()
 	n := 0
 	for _, name := range names {
-		if len(q.queue) >= prefetchQueueLimit {
+		if len(q.queued) >= prefetchQueueLimit {
 			break
 		}
 		if _, ok := q.queued[name]; ok {
 			continue
 		}
 		q.queued[name] = struct{}{}
-		q.queue = append(q.queue, name)
+		if lane == 0 {
+			q.queue = append(q.queue, name)
+		} else {
+			if _, ok := q.lanes[lane]; !ok {
+				q.order = append(q.order, lane)
+			}
+			q.lanes[lane] = append(q.lanes[lane], name)
+		}
 		n++
 	}
 	q.mut.Unlock()
@@ -99,22 +120,50 @@ func (q *prefetchQueue) push(names []string) int {
 	return n
 }
 
-func (q *prefetchQueue) pop() (string, bool) {
+// dropLane forgets the queued files of a crawl actor.
+func (q *prefetchQueue) dropLane(lane int) {
 	q.mut.Lock()
 	defer q.mut.Unlock()
-	if len(q.queue) == 0 {
-		return "", false
+	for _, name := range q.lanes[lane] {
+		delete(q.queued, name)
 	}
-	name := q.queue[0]
-	q.queue = q.queue[1:]
-	delete(q.queued, name)
-	return name, true
+	delete(q.lanes, lane)
+	if i := slices.Index(q.order, lane); i >= 0 {
+		q.order = slices.Delete(q.order, i, i+1)
+	}
+}
+
+// pop returns the next file to prefetch and the lane it came from.
+func (q *prefetchQueue) pop() (string, int, bool) {
+	q.mut.Lock()
+	defer q.mut.Unlock()
+	if len(q.queue) > 0 {
+		name := q.queue[0]
+		q.queue = q.queue[1:]
+		delete(q.queued, name)
+		return name, 0, true
+	}
+	for range len(q.order) {
+		q.next %= len(q.order)
+		lane := q.order[q.next]
+		q.next++
+		if names := q.lanes[lane]; len(names) > 0 {
+			q.lanes[lane] = names[1:]
+			delete(q.queued, names[0])
+			return names[0], lane, true
+		}
+	}
+	return "", 0, false
 }
 
 func (q *prefetchQueue) len() int {
 	q.mut.Lock()
 	defer q.mut.Unlock()
-	return len(q.queue)
+	n := len(q.queue)
+	for _, names := range q.lanes {
+		n += len(names)
+	}
+	return n
 }
 
 // prefetchSiblings queues the small placeholders next to name. It returns
@@ -165,7 +214,7 @@ func (f *sendReceiveFolder) prefetchSiblings(name string) {
 
 func (f *sendReceiveFolder) prefetchWorker(ctx context.Context) {
 	for {
-		name, ok := f.od.pf.pop()
+		name, lane, ok := f.od.pf.pop()
 		if !ok {
 			select {
 			case <-ctx.Done():
@@ -184,7 +233,11 @@ func (f *sendReceiveFolder) prefetchWorker(ctx context.Context) {
 			default:
 			}
 		}
-		if err := f.hydrateName(ctx, name, hydratePrefetch); err != nil {
+		kind := hydratePrefetch
+		if lane != 0 {
+			kind = hydrateLookahead
+		}
+		if err := f.hydrateName(ctx, name, kind); err != nil {
 			// Prefetch is best effort; the file is fetched on open.
 			f.sl.Debug("Prefetch failed", slogutil.FilePath(name), slogutil.Error(err))
 		}

@@ -19,3 +19,9 @@ func fileAtime(path string) time.Time {
 	}
 	return time.Time{}
 }
+
+func processGroup(pid int) int { return pid }
+
+func processGroupAlive(int) bool { return false }
+
+func fileKey(string) ([2]uint64, bool) { return [2]uint64{}, false }
