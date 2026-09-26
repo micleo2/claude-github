@@ -130,8 +130,9 @@ host's network). Both fail identically on unmodified upstream in this environmen
   The kernel has no pre-content hook for `readdir`/`lookup` yet, so listings can't be populated lazily.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
-- **Small files are one round trip each.** About 30 ms per file on a LAN in the tests, so `grep -r` over thousands of
-  online-only files is slow. Batching is a future optimisation.
+- **Small files are fetched one at a time.** About 2.6 ms per file on a LAN (one fetch plus one `fsync`), so latency
+  adds up over thousands of online-only files, especially on high-latency links. Prefetching and pipelining are
+  planned; see [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md).
 - **A metadata-only change to a placeholder can win a conflict against a content change.** This needs the content
   change to carry an *older* mtime. The winning version's content then exists nowhere. The losing content is kept as a
   conflict copy, and the file cannot be hydrated until someone writes it again.
