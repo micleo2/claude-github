@@ -483,14 +483,14 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 // hydrateVia opens name writable through v's private mount (the event fd is
 // read-only) and hydrates it, checking that it is the inode of the event.
 func (l *Listener) hydrateVia(ctx context.Context, v *View, name string, st *unix.Stat_t) error {
-	fd, err := unix.Openat(v.private, name, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	f, restore, err := OpenForWrite(v.private, name)
 	if err != nil {
 		return err
 	}
-	f := os.NewFile(uintptr(fd), name)
 	defer f.Close()
+	defer restore()
 	var wst unix.Stat_t
-	if err := unix.Fstat(fd, &wst); err != nil {
+	if err := unix.Fstat(int(f.Fd()), &wst); err != nil {
 		return err
 	}
 	if wst.Dev != st.Dev || wst.Ino != st.Ino {
@@ -553,6 +553,56 @@ func (l *Listener) resolve(f *os.File, st *unix.Stat_t) (*View, string) {
 		}
 	}
 	return nil, ""
+}
+
+// OpenForWrite opens name (relative to dirfd, not following a final
+// symlink) to write its content in place. A file its owner may not write
+// (git makes objects 0444) is made writable until restore is called; a
+// process with CAP_DAC_OVERRIDE opens it directly. Call restore before
+// closing the file.
+func OpenForWrite(dirfd int, name string) (f *os.File, restore func(), err error) {
+	const flags = unix.O_RDWR | unix.O_NOFOLLOW | unix.O_CLOEXEC
+	fd, err := unix.Openat(dirfd, name, flags, 0)
+	if err == nil {
+		return os.NewFile(uintptr(fd), name), func() {}, nil
+	}
+	if !errors.Is(err, unix.EACCES) {
+		return nil, nil, err
+	}
+	denied := err
+	// An O_PATH open raises no fanotify events and needs no permission.
+	pfd, err := unix.Openat(dirfd, name, unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return nil, nil, denied
+	}
+	defer unix.Close(pfd)
+	var st unix.Stat_t
+	if unix.Fstat(pfd, &st) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG ||
+		int(st.Uid) != os.Geteuid() || st.Mode&0o200 != 0 {
+		return nil, nil, denied
+	}
+	mode := st.Mode & 0o7777
+	proc := fmt.Sprintf("/proc/self/fd/%d", pfd)
+	if err := unix.Fchmodat(unix.AT_FDCWD, proc, mode|0o200, 0); err != nil {
+		return nil, nil, denied
+	}
+	fd, err = unix.Openat(dirfd, name, flags, 0)
+	var wst unix.Stat_t
+	if err == nil && (unix.Fstat(fd, &wst) != nil || wst.Dev != st.Dev || wst.Ino != st.Ino) {
+		unix.Close(fd)
+		err = fmt.Errorf("%s was replaced while opening it: %w", name, unix.EIO)
+	}
+	if err != nil {
+		_ = unix.Fchmodat(unix.AT_FDCWD, proc, mode, 0)
+		return nil, nil, err
+	}
+	f = os.NewFile(uintptr(fd), name)
+	return f, func() { _ = unix.Fchmod(int(f.Fd()), mode) }, nil
+}
+
+// OpenPathForWrite is OpenForWrite for a path.
+func OpenPathForWrite(path string) (*os.File, func(), error) {
+	return OpenForWrite(unix.AT_FDCWD, path)
 }
 
 // IsVirtual reports whether f carries the placeholder xattr.

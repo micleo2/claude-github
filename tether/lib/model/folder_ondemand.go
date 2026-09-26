@@ -585,69 +585,113 @@ func (f *sendReceiveFolder) fetchBlock(ctx context.Context, name string, src pro
 // hydrateName hydrates a placeholder through the folder path (used for pins
 // and explicit requests, not for application access).
 func (f *sendReceiveFolder) hydrateName(ctx context.Context, name string, kind hydrateKind) error {
-	fd, err := os.OpenFile(f.absPath(name), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	fd, restore, err := hsm.OpenPathForWrite(f.absPath(name))
 	if err != nil {
 		return err
 	}
 	defer fd.Close()
+	defer restore()
 	return f.hydrate(ctx, name, fd, kind)
 }
 
 // evict turns a local, fully synced file back into a placeholder.
-func (f *sendReceiveFolder) evict(name string) error {
+// evictBatch evicts files and records them in the index in batches: a
+// transaction per file dominated bulk eviction (V8's 19,816 files took 299
+// s). If we crash before a commit, the scanner notices that the files are
+// placeholders and fixes the index (walker.walkPlaceholder).
+type evictBatch struct {
+	f       *sendReceiveFolder
+	pending []protocol.FileInfo
+	n       int
+	bytes   int64
+}
+
+const evictBatchSize = 1000
+
+func (b *evictBatch) evict(name string) error {
+	fi, evicted, err := b.f.evictFile(name)
+	if err != nil || !evicted {
+		return err
+	}
+	b.pending = append(b.pending, fi)
+	b.n++
+	b.bytes += fi.Size
+	if len(b.pending) >= evictBatchSize {
+		return b.flush()
+	}
+	return nil
+}
+
+// flush commits the pending index updates. Call it when done.
+func (b *evictBatch) flush() error {
+	if len(b.pending) == 0 {
+		return nil
+	}
+	err := b.f.updateLocals(b.pending)
+	b.pending = b.pending[:0]
+	return err
+}
+
+func (b *evictBatch) log() {
+	if b.n > 0 {
+		b.f.sl.Info("Evicted file content", "files", b.n, "size", b.bytes)
+	}
+}
+
+// evictFile turns name into a placeholder and returns its index entry, to be
+// committed by the caller. evicted is false if it already was one.
+func (f *sendReceiveFolder) evictFile(name string) (_ protocol.FileInfo, evicted bool, _ error) {
 	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
 	switch {
 	case err != nil:
-		return err
+		return cur, false, err
 	case !ok || cur.IsDeleted() || cur.Type != protocol.FileInfoTypeFile:
-		return fmt.Errorf("%s: %w", name, fs.ErrNotExist)
+		return cur, false, fmt.Errorf("%s: %w", name, fs.ErrNotExist)
 	case cur.IsVirtual():
-		return nil
+		return cur, false, nil
 	case cur.IsInvalid():
-		return fmt.Errorf("%s: %w", name, errNotInSync)
+		return cur, false, fmt.Errorf("%s: %w", name, errNotInSync)
 	}
 	global, ok, err := f.model.sdb.GetGlobalFile(f.folderID, name)
 	if err != nil {
-		return err
+		return cur, false, err
 	}
 	if !ok || !global.Version.Equal(cur.Version) {
-		return fmt.Errorf("%s: %w", name, errNotInSync)
+		return cur, false, fmt.Errorf("%s: %w", name, errNotInSync)
 	}
 	// Somebody else must hold this exact version, or evicting it would
 	// destroy the only copy.
 	if devs, err := f.model.sdb.GetGlobalAvailability(f.folderID, name); err != nil {
-		return err
+		return cur, false, err
 	} else if len(devs) == 0 {
-		return fmt.Errorf("%s: %w", name, errNoOtherCopy)
+		return cur, false, fmt.Errorf("%s: %w", name, errNoOtherCopy)
 	}
 
-	fd, err := os.OpenFile(f.absPath(name), os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	fd, restore, err := hsm.OpenPathForWrite(f.absPath(name))
 	if err != nil {
-		return err
+		return cur, false, err
 	}
 	defer fd.Close()
+	defer restore()
 	// While the lease is held nobody else can open the file, so nothing can
 	// change it between the check below and the eviction.
 	if err := hsm.Lease(fd); err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+		return cur, false, fmt.Errorf("%s: %w", name, err)
 	}
 	defer hsm.Unlease(fd) //nolint:errcheck
 
 	if err := f.verifyAgainstIndex(fd, cur); err != nil {
 		f.ScheduleForceRescan(name)
-		return fmt.Errorf("%s: %w", name, err)
+		return cur, false, fmt.Errorf("%s: %w", name, err)
 	}
 	if err := f.model.hsmMakePlaceholder(fd, cur); err != nil {
-		return fmt.Errorf("%s: %w", name, err)
+		return cur, false, fmt.Errorf("%s: %w", name, err)
 	}
 
 	cur.LocalFlags |= protocol.FlagLocalVirtual
 	cur.Sequence = 0
-	if err := f.updateLocals([]protocol.FileInfo{cur}); err != nil {
-		return err
-	}
-	slog.Info("Evicted file content", f.LogAttr(), slogutil.FilePath(name), "size", cur.Size)
-	return nil
+	f.sl.Debug("Evicted file content", slogutil.FilePath(name), "size", cur.Size)
+	return cur, true, nil
 }
 
 // verifyAgainstIndex checks that the file on disk is exactly what the index
@@ -762,15 +806,22 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 		return nil
 	}
 	slices.SortFunc(cands, func(a, b cand) int { return a.atime.Compare(b.atime) })
+	batch := &evictBatch{f: f}
+	defer batch.log()
 	for _, c := range cands {
 		if used <= limit {
 			break
 		}
-		if err := f.evict(c.name); err != nil {
+		before := batch.n
+		if err := batch.evict(c.name); err != nil {
 			f.sl.Debug("Not evicting", slogutil.FilePath(c.name), slogutil.Error(err))
-			continue
 		}
-		used -= c.size
+		if batch.n > before {
+			used -= c.size
+		}
+	}
+	if err := batch.flush(); err != nil {
+		return err
 	}
 	if used > limit {
 		f.sl.Info("Cache budget exceeded; remaining files are pinned, in use or not yet synced", "used", used, "budget", limit)
@@ -854,16 +905,18 @@ func (f *sendReceiveFolder) evictPrefix(prefix string) (int, error) {
 	}); err != nil {
 		return 0, err
 	}
-	var n int
+	batch := &evictBatch{f: f}
+	defer batch.log()
 	var errs []error
 	for _, name := range names {
-		if err := f.evict(name); err != nil {
+		if err := batch.evict(name); err != nil {
 			errs = append(errs, err)
-			continue
 		}
-		n++
 	}
-	return n, errors.Join(errs...)
+	if err := batch.flush(); err != nil {
+		errs = append(errs, err)
+	}
+	return batch.n, errors.Join(errs...)
 }
 
 // hydratePrefix hydrates all placeholders under prefix.

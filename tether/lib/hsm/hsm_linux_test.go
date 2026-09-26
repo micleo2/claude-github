@@ -394,3 +394,52 @@ func TestReadOnlyMountAccess(t *testing.T) {
 		t.Fatalf("after: got %q, %v", got, err)
 	}
 }
+
+// A read-only file (git objects are 0444) is written by its owner without
+// CAP_DAC_OVERRIDE, and keeps its mode. Runs itself as nobody.
+func TestOpenForWriteReadOnlyFile(t *testing.T) {
+	if path := os.Getenv("TETHER_OFW_PATH"); path != "" {
+		f, restore, err := OpenPathForWrite(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := f.WriteAt([]byte("written"), 0); err != nil {
+			t.Fatal(err)
+		}
+		restore()
+		f.Close()
+		return
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	setpriv, err := exec.LookPath("setpriv")
+	if err != nil {
+		t.Skip(err)
+	}
+	dir, err := os.MkdirTemp("", "ofw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	const nobody = 65534
+	path := filepath.Join(dir, "obj")
+	if err := os.WriteFile(path, []byte("xxxxxxx"), 0o444); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{dir, path} {
+		os.Chown(p, nobody, nobody)
+	}
+	os.Chmod(dir, 0o755)
+	cmd := exec.Command(setpriv, "--reuid=65534", "--regid=65534", "--clear-groups", "--inh-caps=-all",
+		"--bounding-set=-all", os.Args[0], "-test.run=^TestOpenForWriteReadOnlyFile$")
+	cmd.Env = append(os.Environ(), "TETHER_OFW_PATH="+path)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("as nobody: %v\n%s", err, out)
+	}
+	got, _ := os.ReadFile(path)
+	st, _ := os.Stat(path)
+	if string(got) != "written" || st.Mode().Perm() != 0o444 {
+		t.Fatalf("content %q, mode %v", got, st.Mode().Perm())
+	}
+}

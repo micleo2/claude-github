@@ -59,4 +59,5 @@ func ReadPlaceholderFile(*os.File) (string, []byte, bool) { return "", nil, fals
 func Finish(*os.File, time.Time, time.Time) error         { return errUnsupported }
 func MarkVirtual(*os.File, int64, string, []byte) error   { return errUnsupported }
 func Lease(*os.File) error                                { return errUnsupported }
+func OpenPathForWrite(string) (*os.File, func(), error)   { return nil, nil, errUnsupported }
 func Unlease(*os.File) error                              { return errUnsupported }
