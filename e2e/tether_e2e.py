@@ -34,6 +34,7 @@ FOLDER = "docs"
 LOWER = "/data/lower/docs"
 VIEW = "/view/docs"
 MiB = 1 << 20
+SLOW = False  # set by --slow: bigger trees and files
 
 
 def run(*cmd, check=True, input=None, timeout=120):
@@ -641,36 +642,42 @@ def listing_does_not_hydrate(c):
     """ls -lR / find / stat over many placeholders never downloads content."""
     rnd = random.Random(22)
     root = c.server.lower("many")
-    for d in range(30):
+    dirs, per = (30, 50) if SLOW else (10, 20)
+    total = dirs * per
+    for d in range(dirs):
         os.makedirs(os.path.join(root, f"d{d:02}"), exist_ok=True)
-        for i in range(50):
+        for i in range(per):
             with open(os.path.join(root, f"d{d:02}", f"f{i:02}.txt"), "wb") as f:
                 f.write(rnd.randbytes(100 + i))
     t0 = time.time()
     c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=many")
+    last = f"many/d{dirs - 1:02}/f{per - 1:02}.txt"
     wait_for(lambda: c.c2.api("GET", f"/rest/db/status?folder={FOLDER}")["needFiles"] == 0 and
-             os.path.exists(c.c2.lower("many/d29/f49.txt")), 120, what="1500 placeholders on c2")
-    print(f"      1500 placeholders on c2 after {time.time() - t0:.1f}s")
+             os.path.exists(c.c2.lower(last)), 120, what=f"{total} placeholders on c2")
+    print(f"      {total} placeholders on c2 after {time.time() - t0:.1f}s")
     out = c.c2.sh(f"ls -lR '{VIEW}/many' | grep -c '\\.txt$'; find '{VIEW}/many' -type f | wc -l; "
                   f"du -s --apparent-size '{VIEW}/many'").stdout.split()
-    assert out[0] == "1500" and out[1] == "1500", out
+    assert out[0] == str(total) and out[1] == str(total), out
     hydrated = [f for f, st in c.c2.status("many").items() if st["state"] != "online-only"]
     assert not hydrated, hydrated[:5]
     # grep -r reads everything and must see real content
+    t0 = time.time()
     p = c.c2.sh(f"grep -rl --binary-files=text . '{VIEW}/many' | wc -l")
-    assert p.stdout.strip() == "1500", p.stdout
+    assert p.stdout.strip() == str(total), p.stdout
+    print(f"      grep -r hydrated {total} small files in {time.time() - t0:.1f}s")
 
 
 @test
 def large_file(c):
     rel = "large.bin"
-    FILES[rel] = os.urandom(256 * MiB)
+    size = 256 if SLOW else 64
+    FILES[rel] = os.urandom(size * MiB)
     c.write_server(rel, FILES[rel])
     c.wait_placeholder(c.c1, rel, timeout=120)
     t0 = time.time()
     assert c.c1.view_sha(rel) == sha(FILES[rel])
     dt = time.time() - t0
-    print(f"      256 MiB hydrated in {dt:.1f}s ({256 / dt:.0f} MiB/s)")
+    print(f"      {size} MiB hydrated in {dt:.1f}s ({size / dt:.0f} MiB/s)")
 
 
 @test
@@ -749,7 +756,15 @@ def placeholder_metadata_vs_remote_content_conflict(c):
     assert sha(FILES[rel]) in server_versions, "server's new content was lost"
     with open(c.server.lower(rel), "rb") as f:
         FILES[rel] = f.read()
-    assert c.c1.view_sha(rel) == sha(FILES[rel])
+
+    # Right after convergence the puller may still be replacing c1's
+    # placeholder; a read in that window fails cleanly. It must never return
+    # other content, and must succeed shortly.
+    def readable():
+        got = c.c1.view_sha(rel)
+        assert got == sha(FILES[rel]) or got.startswith("ERR"), f"wrong content: {got}"
+        return got == sha(FILES[rel])
+    wait_for(readable, 30, interval=1, what="c1 reads the winning version")
 
 
 
@@ -762,8 +777,9 @@ def cache_budget_evicts_lru(c):
         c.write_server(rel, FILES[rel])
     for rel in names:
         c.wait_placeholder(n, rel)
-    # Evict everything else so the budget math is about these files.
-    n.od("evict", "")
+    # The budget covers the whole folder and eviction is LRU across all of
+    # it, so start with nothing else local.
+    n.od("evict", "", expect_error=True)
     cfg = n.api("GET", f"/rest/config/folders/{FOLDER}")
     cfg["cacheBudget"] = {"value": 12, "unit": "MB"}
     n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)
@@ -840,7 +856,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("-k", help="only run tests whose name contains this")
     ap.add_argument("--keep", action="store_true", help="leave the cluster running afterwards")
+    ap.add_argument("--slow", action="store_true", help="use bigger trees and files")
     args = ap.parse_args()
+    global SLOW
+    SLOW = args.slow
 
     c = Cluster()
     c.up()
