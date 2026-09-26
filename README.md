@@ -19,6 +19,7 @@ program reads a normal local file at native speed.
   [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md)
 - **Eviction (survey and measurements):** [docs/research/eviction.md](docs/research/eviction.md)
 - **Keeping placeholders guarded across daemon restarts:** [docs/research/daemon-restart.md](docs/research/daemon-restart.md)
+- **Stale placeholders and failed hydrations (survey, churn stress test):** [docs/research/stale-placeholders.md](docs/research/stale-placeholders.md)
 - **Next step, crawler-aware prefetch:** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
 
 Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` for the CLI).
@@ -122,7 +123,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 39 end-to-end tests, ~4 min
+sudo e2e/run.sh                          # 42 end-to-end tests, ~5 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -131,14 +132,14 @@ loop-mounted ext4 filesystem. The suite covers:
 
 - hydration through every access path
 - concurrent readers
-- remote updates, pins and local edits
+- remote updates, pins and local edits, and placeholders superseded before the puller catches up
 - rename, move, `chmod` and delete of placeholders
 - directory renames and atomic-save editors
 - eviction, including the refusals
 - offline and silent network loss
 - peers never serving placeholders
 - indexer denial and the cache budget
-- `kill -9` recovery and client restart
+- `kill -9` recovery, interrupted hydrations and client restart
 - conflicts
 - the CLI
 - a final check that no file ever became zeros
@@ -176,6 +177,10 @@ host's network). Both fail identically on unmodified upstream in this environmen
 - **A metadata-only change to a placeholder can win a conflict against a content change.** This needs the content
   change to carry an *older* mtime. The winning version's content then exists nowhere. The losing content is kept as a
   conflict copy, and the file cannot be hydrated until someone writes it again.
+- **A file that changes on its source faster than it can be fetched** may fail to open with `EIO`: the source no
+  longer has the old version, and has not announced the new one yet. Superseded placeholders otherwise hydrate at the
+  latest version. In a stress test with 20 rewrites a second, 0.2% of reads failed and none returned wrong data. See
+  [docs/research/stale-placeholders.md](docs/research/stale-placeholders.md).
 - **Ignore patterns (`.stignore`)** are not tested with on-demand folders and not supported there.
 - **Privileges.** The daemon runs with `CAP_SYS_ADMIN`. The split into a small privileged helper and an unprivileged
   sync daemon (PLAN.md §4.6) is not implemented yet.

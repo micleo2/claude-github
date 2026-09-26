@@ -102,6 +102,12 @@ Notes on 2 and 4:
   therefore stays atime-based. Under `relatime` that resolves to about a day for files read repeatedly, and under
   `noatime` it degrades to download order.
 
+**Found later by the churn stress test** ([stale-placeholders.md](stale-placeholders.md) §4): eviction must mark the
+file *before* taking its lease. The kernel decides whether an open file raises pre-content events before that open
+waits for a lease, so an open racing an eviction that leased first could read the placeholder's zeros.
+`hsm.Listener.Evict` now marks the file, then takes the lease, then truncates through the private mount. Eviction
+batches are also re-validated at commit time, under the same lock as the puller's commits.
+
 Not recommended: asynchronous truncation or unlinking. In CernVM-FS it frees space off the critical path, but for
 tether the truncation is what makes the placeholder and must happen under the lease.
 

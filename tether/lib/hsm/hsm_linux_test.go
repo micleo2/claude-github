@@ -21,6 +21,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -229,23 +231,13 @@ func TestEvictAndRehydrate(t *testing.T) {
 		t.Fatal("first hydration")
 	}
 
-	// Evict under a lease, as the model does.
-	f, err := os.OpenFile(filepath.Join(lower, "r"), os.O_RDWR, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := Lease(f); err != nil {
-		t.Fatal(err)
-	}
 	start := time.Now()
-	if err := l.MakePlaceholder(f, int64(len(content)), "r", []byte("bh")); err != nil {
+	if err := l.Evict("f", "r", int64(len(content)), "r", []byte("bh"), func(*os.File) error { return nil }); err != nil {
 		t.Fatal(err)
 	}
 	if d := time.Since(start); d > 5*time.Second {
 		t.Fatalf("eviction under a lease took %v (event raised against our own lease?)", d)
 	}
-	Unlease(f)
-	f.Close()
 
 	var st unix.Stat_t
 	unix.Stat(filepath.Join(lower, "r"), &st)
@@ -588,6 +580,11 @@ func TestGuard(t *testing.T) {
 	if err := RemoveGuard(dir); err != nil {
 		t.Fatal(err)
 	}
+	if n := attachedGuards(t); n > 0 {
+		// The guard is system wide: one installed by a running tether
+		// (not by this test) keeps guarding our placeholder.
+		t.Skipf("%d other placeholder guard(s) attached on this system", n)
+	}
 	start = time.Now()
 	var got []byte
 	for got, err = os.ReadFile(filepath.Join(lower, "later")); err != nil && time.Since(start) < 5*time.Second; got, err = os.ReadFile(filepath.Join(lower, "later")) {
@@ -597,4 +594,151 @@ func TestGuard(t *testing.T) {
 		t.Fatalf("after removing the guard: %q, %v", got, err)
 	}
 	t.Logf("guard detached %v after removal", time.Since(start).Round(time.Millisecond))
+}
+
+func TestDiscardAndRetarget(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "f")
+	if err := os.WriteFile(path, bytes.Repeat([]byte("x"), 1<<20), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t0 := time.Unix(1_700_000_000, 123456789)
+	if err := os.Chtimes(path, t0, t0); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if err := MarkVirtual(f, 1<<20, "f", []byte("bh")); err != nil {
+		if errors.Is(err, unix.EOPNOTSUPP) {
+			t.Skip("no user xattrs here")
+		}
+		t.Fatal(err)
+	}
+	check := func(what string, size int64, mtime time.Time) {
+		t.Helper()
+		var st unix.Stat_t
+		if err := unix.Fstat(int(f.Fd()), &st); err != nil {
+			t.Fatal(err)
+		}
+		if st.Size != size || !time.Unix(st.Mtim.Unix()).Equal(mtime) || st.Blocks > 8 {
+			t.Fatalf("%s: size %d mtime %v blocks %d, want %d %v 0", what, st.Size, time.Unix(st.Mtim.Unix()), st.Blocks, size, mtime)
+		}
+		if Interrupted(path) {
+			t.Fatalf("%s: hydration marker left", what)
+		}
+		if !IsVirtual(f) {
+			t.Fatalf("%s: no longer a placeholder", what)
+		}
+	}
+	check("placeholder", 1<<20, t0)
+
+	// A failed hydration: some content written, the mtime bumped. A second
+	// attempt must not overwrite the recorded mtime.
+	for range 2 {
+		if mtime, err := BeginHydration(f); err != nil || !mtime.Equal(t0) {
+			t.Fatal(mtime, err)
+		}
+		if _, err := f.WriteAt(bytes.Repeat([]byte("y"), 256<<10), 128<<10); err != nil {
+			t.Fatal(err)
+		}
+		if !Interrupted(path) {
+			t.Fatal("no hydration marker")
+		}
+	}
+	if err := Discard(f); err != nil {
+		t.Fatal(err)
+	}
+	check("discarded", 1<<20, t0)
+	if err := Discard(f); err != nil {
+		t.Fatal("discard without marker:", err)
+	}
+
+	t1 := time.Unix(1_800_000_000, 5)
+	if _, err := BeginHydration(f); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte("z"), 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := Retarget(f, 3000, "g", []byte("bh2"), t1); err != nil {
+		t.Fatal(err)
+	}
+	check("retargeted", 3000, t1)
+	if origin, bh, ok := ReadPlaceholder(path); !ok || origin != "g" || string(bh) != "bh2" {
+		t.Fatalf("retargeted: %q %q %v", origin, bh, ok)
+	}
+}
+
+// attachedGuards counts placeholder guard programs attached by others. Ours
+// may linger for a moment after RemoveGuard, so this waits for the count
+// to settle.
+func attachedGuards(t *testing.T) int {
+	count := func() int {
+		n := 0
+		it := new(link.Iterator)
+		defer it.Close()
+		for it.Next() {
+			info, err := it.Link.Info()
+			if err != nil || info.Type != link.TracingType {
+				continue
+			}
+			p, err := ebpf.NewProgramFromID(info.Program)
+			if err != nil {
+				continue
+			}
+			pi, err := p.Info()
+			p.Close()
+			if err == nil && pi.Name == guardProgram {
+				n++
+			}
+		}
+		return n
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	n := count()
+	for n > 0 && time.Now().Before(deadline) {
+		time.Sleep(50 * time.Millisecond)
+		n = count()
+	}
+	return n
+}
+
+// An open that races with an eviction waits for its lease, but the kernel
+// decides whether the file raises pre-content events before that wait. It
+// must not read the placeholder's zeros.
+func TestEvictRacingOpen(t *testing.T) {
+	content := bytes.Repeat([]byte("racing open "), 1000)
+	h := &mapHandler{data: map[string][]byte{"f/r": content}}
+	lower, view, l := setup(t, h, nil)
+	if err := os.WriteFile(filepath.Join(lower, "r"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan []byte, 1)
+	start := time.Now()
+	err := l.Evict("f", "r", int64(len(content)), "r", []byte("bh"), func(*os.File) error {
+		go func() {
+			b, err := os.ReadFile(filepath.Join(view, "r"))
+			if err != nil {
+				b = []byte(err.Error())
+			}
+			got <- b
+		}()
+		time.Sleep(200 * time.Millisecond) // by now the open waits for our lease
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(start); d > 5*time.Second {
+		t.Fatalf("eviction took %v", d)
+	}
+	b := <-got
+	if !bytes.Equal(b, content) {
+		t.Fatalf("racing reader got %d bytes (zeros: %v), want the content", len(b), len(b) > 0 && bytes.Count(b, []byte{0}) == len(b))
+	}
+	if h.calls.Load() != 1 {
+		t.Fatalf("handler called %d times, want 1", h.calls.Load())
+	}
 }

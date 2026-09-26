@@ -55,6 +55,11 @@ const (
 	// identified without reading it.
 	XattrOrigin     = "user.tether.origin"
 	XattrBlocksHash = "user.tether.bh"
+	// XattrHydrating is set while content is being written into a
+	// placeholder and holds its modification time from before (writing
+	// bumps it). If it is still there when nobody is hydrating, a hydration
+	// failed or was interrupted: see Discard.
+	XattrHydrating = "user.tether.hydrating"
 	// XattrPrefix covers all of the above. These attributes are local
 	// bookkeeping and must never be synced.
 	XattrPrefix = "user.tether."
@@ -380,6 +385,61 @@ func (l *Listener) MakePlaceholder(f *os.File, size int64, origin string, blocks
 		return err
 	}
 	return l.markMask(fd, unix.FAN_PRE_ACCESS)
+}
+
+// Evict turns the local file name in folder into a placeholder, if check
+// approves of its content. check runs while nobody else can open the file.
+//
+// The file is marked before anyone is locked out: the kernel decides at
+// open time, before waiting for our lease, whether a file raises
+// pre-content events. An open that raced with a later mark would read the
+// placeholder's zeros. Our own accesses go through the private mount,
+// which raises no events: the event fd for our truncation would have to
+// wait for our own lease.
+func (l *Listener) Evict(folder, name string, size int64, origin string, blocksHash []byte, check func(*os.File) error) error {
+	l.mu.Lock()
+	var v *View
+	for _, x := range l.views {
+		if x.Folder == folder {
+			v = x
+		}
+	}
+	if v == nil {
+		l.mu.Unlock()
+		return fmt.Errorf("no view for folder %s", folder)
+	}
+	f, restore, err := OpenForWrite(v.private, name)
+	l.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	defer restore()
+	fd := int(f.Fd())
+	if err := l.markMask(fd, eventMask); err != nil {
+		return err
+	}
+	evicted := false
+	defer func() {
+		if !evicted {
+			l.unmark(fd)
+		}
+	}()
+	// While the lease is held nobody else can open the file, so nothing can
+	// change it between the check and the eviction.
+	if err := Lease(f); err != nil {
+		return err
+	}
+	defer Unlease(f) //nolint:errcheck
+	if err := check(f); err != nil {
+		return err
+	}
+	if err := MarkVirtual(f, size, origin, blocksHash); err != nil {
+		evicted = IsVirtual(f) // keep the mark on anything that says it is a placeholder
+		return err
+	}
+	evicted = true
+	return nil
 }
 
 func (l *Listener) markMask(fd int, mask uint64) error {
@@ -756,6 +816,96 @@ func ReadPlaceholderFile(f *os.File) (origin string, blocksHash []byte, isPlaceh
 	return origin, blocksHash, true
 }
 
+// BeginHydration records f's modification time in XattrHydrating before
+// content is written into it, and returns it. A marker left by an earlier
+// attempt is kept: it holds the time from before that attempt, which is
+// returned instead.
+func BeginHydration(f *os.File) (mtime time.Time, err error) {
+	fd := int(f.Fd())
+	var b [8]byte
+	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil && n == len(b) {
+		return time.Unix(0, int64(binary.LittleEndian.Uint64(b[:]))), nil
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return time.Time{}, err
+	}
+	binary.LittleEndian.PutUint64(b[:], uint64(st.Mtim.Nano()))
+	if err := unix.Fsetxattr(fd, XattrHydrating, b[:], 0); err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(st.Mtim.Unix()), nil
+}
+
+// Interrupted reports whether the placeholder at path holds content from a
+// hydration that failed or was interrupted (see XattrHydrating).
+func Interrupted(path string) bool {
+	_, err := unix.Lgetxattr(path, XattrHydrating, nil)
+	return err == nil
+}
+
+// Discard undoes a failed hydration of the placeholder f: the partial
+// content is freed and the modification time restored, so that the file is
+// exactly the placeholder it was. Otherwise the scanner would take the
+// bumped modification time for a local change and announce a new version.
+// Nobody else may be hydrating f.
+func Discard(f *os.File) error {
+	fd := int(f.Fd())
+	var b [8]byte
+	n, err := unix.Fgetxattr(fd, XattrHydrating, b[:])
+	if errors.Is(err, unix.ENODATA) {
+		return nil // nothing was written
+	} else if err != nil {
+		return err
+	}
+	if n != len(b) {
+		return fmt.Errorf("corrupt %s", XattrHydrating)
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
+		return err
+	}
+	if err := unix.Ftruncate(fd, 0); err != nil {
+		return err
+	}
+	if err := unix.Ftruncate(fd, st.Size); err != nil {
+		return err
+	}
+	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(int64(binary.LittleEndian.Uint64(b[:])))}
+	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
+		return err
+	}
+	return unix.Fremovexattr(fd, XattrHydrating)
+}
+
+// Retarget makes the placeholder f stand for other content: a different
+// size, identity and modification time. Nobody else may be hydrating f.
+func Retarget(f *os.File, size int64, origin string, blocksHash []byte, mtime time.Time) error {
+	if err := Discard(f); err != nil {
+		return err
+	}
+	if err := MarkVirtual(f, size, origin, blocksHash); err != nil {
+		return err
+	}
+	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(mtime.UnixNano())}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", int(f.Fd())), ts, 0)
+}
+
+// Ctime returns the status change time of the file at path.
+func Ctime(path string) (time.Time, error) {
+	var st unix.Stat_t
+	if err := unix.Lstat(path, &st); err != nil {
+		return time.Time{}, err
+	}
+	return time.Unix(st.Ctim.Unix()), nil
+}
+
+// Unlinked reports whether f has no name left.
+func Unlinked(f *os.File) bool {
+	var st unix.Stat_t
+	return unix.Fstat(int(f.Fd()), &st) == nil && st.Nlink == 0
+}
+
 // Finish completes a hydration: the placeholder attributes are removed, the
 // modification time is reset to mtime (writing the content bumped it) and
 // the access time set to atime.
@@ -765,7 +915,9 @@ func Finish(f *os.File, mtime, atime time.Time) error {
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
 		return err
 	}
-	for _, name := range []string{XattrOrigin, XattrBlocksHash, XattrState} {
+	// The hydration marker goes last: until the state is gone, it tells
+	// the scanner that the modification time is not to be trusted.
+	for _, name := range []string{XattrOrigin, XattrBlocksHash, XattrState, XattrHydrating} {
 		if err := unix.Fremovexattr(fd, name); err != nil && !errors.Is(err, unix.ENODATA) {
 			return err
 		}

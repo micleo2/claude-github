@@ -164,6 +164,18 @@ func (m *model) hsmMakePlaceholder(fd *os.File, file protocol.FileInfo) error {
 	return l.MakePlaceholder(fd, file.Size, file.Name, blocksHashOf(file))
 }
 
+// hsmEvict turns the local file name into a placeholder for file, if check
+// approves of the content (see hsm.Listener.Evict).
+func (m *model) hsmEvict(folder, name string, file protocol.FileInfo, check func(*os.File) error) error {
+	m.od.mut.Lock()
+	l := m.od.l
+	m.od.mut.Unlock()
+	if l == nil {
+		return errors.New("on-demand listener is not running")
+	}
+	return l.Evict(folder, name, file.Size, file.Name, blocksHashOf(file), check)
+}
+
 func (m *model) hsmUnmark(fd *os.File) {
 	m.od.mut.Lock()
 	l := m.od.l
@@ -302,12 +314,17 @@ func (m *model) OnDemandEvict(folder, path string, verify bool) (int, error) {
 		return 0, err
 	}
 	var n int
+	var evictErr error
 	err = sr.doInSync(func(context.Context) error {
-		var err error
-		n, err = sr.evictPrefix(path, verify)
-		return err
+		// Refusals (a file in use, or not in sync) are for the caller;
+		// they do not put the folder into an error state.
+		n, evictErr = sr.evictPrefix(path, verify)
+		return nil
 	})
-	return n, err
+	if err != nil {
+		return n, err
+	}
+	return n, evictErr
 }
 
 func (m *model) OnDemandHydrate(ctx context.Context, folder, path string) (int, error) {

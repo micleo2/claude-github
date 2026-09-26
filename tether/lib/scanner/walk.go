@@ -75,10 +75,21 @@ type Config struct {
 
 type PlaceholderChecker interface {
 	// Placeholder reports whether the file at name is an on-demand
-	// placeholder and, if the index still knows the content it stands for,
-	// returns that file (with blocks). ok is false for placeholders whose
-	// content is unknown; those are left alone.
-	Placeholder(name string) (source protocol.FileInfo, isPlaceholder, ok bool)
+	// placeholder, and describes it.
+	Placeholder(name string) (p Placeholder, isPlaceholder bool)
+}
+
+type Placeholder struct {
+	// Source is the index entry (with blocks) of the content the
+	// placeholder stands for. Known is false if the index no longer has it
+	// or the placeholder is busy; such placeholders are left alone.
+	Source protocol.FileInfo
+	Known  bool
+	// Size and ModTime are the placeholder's, observed while no hydration
+	// was writing to it (which bumps the modification time). They take
+	// precedence over what the walk saw.
+	Size    int64
+	ModTime time.Time
 }
 
 type CurrentFiler interface {
@@ -486,8 +497,8 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 	f.New = !hasCurFile
 
 	if w.Placeholders != nil {
-		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
-			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		if p, isPlaceholder := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, p, finishedChan)
 		}
 	}
 
@@ -501,7 +512,7 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 			IgnoreXattrs:    !w.ScanXattrs,
 		}) {
 			if curFile.IsVirtual() && w.Placeholders != nil {
-				if _, isPlaceholder, _ := w.Placeholders.Placeholder(relPath); !isPlaceholder {
+				if _, isPlaceholder := w.Placeholders.Placeholder(relPath); !isPlaceholder {
 					// Hydrated, but the index was not updated (e.g. a
 					// crash before the batched commit). Record that
 					// without creating a new version.
@@ -546,11 +557,15 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 // disk, so it is never hashed: the block list comes from the index entry of
 // the file it was created for (which may have had a different name, if the
 // placeholder was moved).
-func (w *walker) walkPlaceholder(ctx context.Context, f, curFile protocol.FileInfo, hasCurFile bool, src protocol.FileInfo, ok bool, finishedChan chan<- ScanResult) error {
-	if !ok || src.Size != f.Size {
+func (w *walker) walkPlaceholder(ctx context.Context, f, curFile protocol.FileInfo, hasCurFile bool, p Placeholder, finishedChan chan<- ScanResult) error {
+	src := p.Source
+	if !p.Known || src.Size != p.Size {
 		l.Debugln(w, "leaving unknown placeholder alone:", f.Name)
 		return nil
 	}
+	f.Size = p.Size
+	f.ModifiedS = p.ModTime.Unix()
+	f.ModifiedNs = int32(p.ModTime.Nanosecond())
 
 	if hasCurFile && !curFile.IsDeleted() && bytes.Equal(curFile.BlocksHash, src.BlocksHash) &&
 		curFile.IsEquivalentOptional(f, protocol.FileInfoComparison{
@@ -570,6 +585,21 @@ func (w *walker) walkPlaceholder(ctx context.Context, f, curFile protocol.FileIn
 		// version.
 		curFile.LocalFlags |= protocol.FlagLocalVirtual
 		f = curFile
+	} else if hasCurFile && src.Name == f.Name && src.Version.GreaterEqual(curFile.Version) && !src.Version.Equal(curFile.Version) &&
+		src.IsEquivalentOptional(f, protocol.FileInfoComparison{
+			ModTimeWindow:   w.ModTimeWindow,
+			IgnorePerms:     w.IgnorePerms,
+			IgnoreBlocks:    true,
+			IgnoreFlags:     protocol.LocalAllFlags,
+			IgnoreOwnership: !w.ScanOwnership,
+			IgnoreXattrs:    !w.ScanXattrs,
+		}) {
+		// The placeholder was switched to a newer version (a superseded
+		// placeholder was hydrated, and that was interrupted before it
+		// was recorded). Record that version, not a new one: that would
+		// conflict with it.
+		f = src
+		f.LocalFlags = w.LocalFlags | protocol.FlagLocalVirtual
 	} else {
 		// Metadata change or move of a placeholder: a new version with
 		// the same content.
@@ -602,8 +632,8 @@ func (w *walker) walkDir(ctx context.Context, relPath string, info fs.FileInfo, 
 	f.New = !hasCurFile
 
 	if w.Placeholders != nil {
-		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
-			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		if p, isPlaceholder := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, p, finishedChan)
 		}
 	}
 
@@ -662,8 +692,8 @@ func (w *walker) walkSymlink(ctx context.Context, relPath string, info fs.FileIn
 	f.New = !hasCurFile
 
 	if w.Placeholders != nil {
-		if src, isPlaceholder, ok := w.Placeholders.Placeholder(relPath); isPlaceholder {
-			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, src, ok, finishedChan)
+		if p, isPlaceholder := w.Placeholders.Placeholder(relPath); isPlaceholder {
+			return w.walkPlaceholder(ctx, f, curFile, hasCurFile, p, finishedChan)
 		}
 	}
 

@@ -69,6 +69,15 @@ type onDemandState struct {
 	hydrated    map[string][]byte // name -> blocks hash
 	hydratedC   chan struct{}
 
+	// indexMut orders our index updates with the puller's: it is held
+	// while the puller commits a batch, and by our commits from validating
+	// against the disk until written. Otherwise an update validated before
+	// the puller replaced the file could land after the puller's record of
+	// the replacement, and the index would describe a file that is gone.
+	indexMut sync.Mutex
+	// flushPuller asks the puller to commit its batch now.
+	flushPuller chan struct{}
+
 	// One hydration per file at a time; later callers wait for it.
 	flightMut sync.Mutex
 	flights   map[string]*hydrationFlight
@@ -84,12 +93,13 @@ type onDemandState struct {
 
 func newOnDemandState() *onDemandState {
 	return &onDemandState{
-		hydrating: make(map[string]struct{}),
-		started:   time.Now(),
-		hydrated:  make(map[string][]byte),
-		hydratedC: make(chan struct{}, 1),
-		flights:   make(map[string]*hydrationFlight),
-		pf:        newPrefetchQueue(),
+		hydrating:   make(map[string]struct{}),
+		started:     time.Now(),
+		hydrated:    make(map[string][]byte),
+		hydratedC:   make(chan struct{}, 1),
+		flushPuller: make(chan struct{}, 1),
+		flights:     make(map[string]*hydrationFlight),
+		pf:          newPrefetchQueue(),
 	}
 }
 
@@ -260,17 +270,101 @@ type placeholderChecker struct {
 	f *sendReceiveFolder
 }
 
-func (c placeholderChecker) Placeholder(name string) (protocol.FileInfo, bool, bool) {
-	origin, bh, ok := hsm.ReadPlaceholder(c.f.absPath(name))
+func (c placeholderChecker) Placeholder(name string) (scanner.Placeholder, bool) {
+	f := c.f
+	path := f.absPath(name)
+	origin, bh, ok := hsm.ReadPlaceholder(path)
 	if !ok {
-		return protocol.FileInfo{}, false, false
+		return scanner.Placeholder{}, false
 	}
-	if c.f.isHydrating(name) {
+	// Keep hydrations of this file out while we look at it: the
+	// modification time is not the file's while content is being written.
+	f.od.flightMut.Lock()
+	_, busy := f.od.flights[name]
+	if !busy {
+		f.od.flights[name] = &hydrationFlight{done: make(chan struct{})}
+	}
+	f.od.flightMut.Unlock()
+	if busy || f.isHydrating(name) {
 		// Content is being written right now; leave it alone.
-		return protocol.FileInfo{}, true, false
+		return scanner.Placeholder{}, true
 	}
-	src, ok := c.f.placeholderSource(name, origin, bh)
-	return src, true, ok
+	defer func() {
+		f.od.flightMut.Lock()
+		fl := f.od.flights[name]
+		delete(f.od.flights, name)
+		f.od.flightMut.Unlock()
+		close(fl.done)
+	}()
+
+	if hsm.Interrupted(path) {
+		// A hydration failed without cleaning up, or we crashed during
+		// one.
+		if err := f.discardPartial(name); err != nil {
+			f.sl.Warn("Failed to reset interrupted hydration", slogutil.FilePath(name), slogutil.Error(err))
+			return scanner.Placeholder{}, true
+		}
+		f.sl.Info("Reset interrupted hydration", slogutil.FilePath(name))
+		if origin, bh, ok = hsm.ReadPlaceholder(path); !ok {
+			return scanner.Placeholder{}, false
+		}
+	}
+	src, ok := f.placeholderSource(name, origin, bh)
+	if !ok && origin == name {
+		if cur, healed := f.healUnknownPlaceholder(name); healed {
+			src, ok = cur, true
+		}
+	}
+	st, err := os.Lstat(path)
+	if err != nil {
+		return scanner.Placeholder{}, true
+	}
+	return scanner.Placeholder{Source: src, Known: ok, Size: st.Size(), ModTime: st.ModTime()}, true
+}
+
+// unknownPlaceholderGrace is how long a placeholder may stand for content
+// the index does not know before it is reset: the puller records the
+// placeholders it creates up to two seconds late.
+const unknownPlaceholderGrace = 10 * time.Second
+
+// healUnknownPlaceholder resets the placeholder at name to the local index
+// entry, if that says the file has no local content and the placeholder
+// stands for content the index does not know (and has for a while). No
+// content is lost: neither has any. Otherwise the placeholder would be
+// stuck: the scanner leaves unknown placeholders alone, and the puller
+// does not replace a file that differs from the index. The caller must
+// keep hydrations of name out.
+func (f *sendReceiveFolder) healUnknownPlaceholder(name string) (protocol.FileInfo, bool) {
+	ctime, err := hsm.Ctime(f.absPath(name))
+	if err != nil || time.Since(ctime) < unknownPlaceholderGrace {
+		return protocol.FileInfo{}, false
+	}
+	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
+	if err != nil || !ok || !cur.IsVirtual() || cur.IsDeleted() || cur.Type != protocol.FileInfoTypeFile || len(cur.Blocks) == 0 && cur.Size > 0 {
+		return protocol.FileInfo{}, false
+	}
+	fd, restore, err := hsm.OpenPathForWrite(f.absPath(name))
+	if err != nil {
+		return protocol.FileInfo{}, false
+	}
+	defer fd.Close()
+	defer restore()
+	if err := hsm.Retarget(fd, cur.Size, name, blocksHashOf(cur), cur.ModTime()); err != nil {
+		f.sl.Warn("Failed to reset placeholder of unknown content", slogutil.FilePath(name), slogutil.Error(err))
+		return protocol.FileInfo{}, false
+	}
+	f.sl.Info("Reset placeholder of unknown content to the indexed version", slogutil.FilePath(name))
+	return cur, true
+}
+
+func (f *sendReceiveFolder) discardPartial(name string) error {
+	fd, restore, err := hsm.OpenPathForWrite(f.absPath(name))
+	if err != nil {
+		return err
+	}
+	defer fd.Close()
+	defer restore()
+	return hsm.Discard(fd)
 }
 
 var _ scanner.PlaceholderChecker = placeholderChecker{}
@@ -345,10 +439,151 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	f.setHydrating(name, true)
 	defer f.setHydrating(name, false)
 
-	src, ok := f.placeholderSource(name, origin, bh)
-	if !ok {
-		return fmt.Errorf("%s: %w", name, errNoPlaceholderSource)
+	src, known := f.placeholderSource(name, origin, bh)
+	if !known && origin == name && !hsm.Unlinked(dst) {
+		// The puller records the placeholders it creates in batches, up
+		// to two seconds later.
+		src, known = f.awaitPlaceholderSource(ctx, name, origin, bh, dst)
 	}
+	// Whether the index is to learn that the file was hydrated: not for an
+	// unlinked placeholder.
+	record := true
+	for attempt := 0; ; attempt++ {
+		err := fmt.Errorf("%s: %w", name, errNoPlaceholderSource)
+		if known {
+			if newer, ok := f.supersededBy(name, dst, bh); ok && record {
+				// The placeholder stands for a version that has been
+				// replaced; the puller just has not caught up yet. Peers
+				// may no longer have the old content. Nothing of it was
+				// ever read (a placeholder is hydrated completely before
+				// any access), so it can switch to the latest version,
+				// like Windows' CF_OPERATION_TYPE_RESTART_HYDRATION or a
+				// File Provider fetch without strict versioning. See
+				// docs/research/stale-placeholders.md.
+				if record, err = f.switchPlaceholder(name, dst, newer); err != nil {
+					return err
+				}
+				f.sl.Debug("Hydrating newer version of superseded placeholder", slogutil.FilePath(name))
+				src, bh = newer, blocksHashOf(newer)
+			}
+			err = f.hydrateContent(ctx, name, src, dst, kind)
+			if err == nil {
+				if record {
+					f.od.hydratedMut.Lock()
+					f.od.hydrated[name] = bh
+					f.od.hydratedMut.Unlock()
+					select {
+					case f.od.hydratedC <- struct{}{}:
+					default:
+					}
+				}
+				return nil
+			}
+		}
+		if attempt > 0 || ctx.Err() != nil {
+			return err
+		}
+		// A second chance, if the content can no longer be had because the
+		// file changed meanwhile. A peer that finds its file no longer
+		// matches the index rescans it: wait for the new version.
+		if known && errors.Is(err, protocol.ErrNoSuchFile) {
+			f.awaitNewerGlobal(ctx, name, src)
+		}
+		if hsm.Unlinked(dst) {
+			// The puller replaced the placeholder while it was being
+			// opened; the application holds the old, unlinked one. Any
+			// complete version will do, and there is no index entry to
+			// update: give it the latest.
+			g, ok := f.latestGlobal(name)
+			if !ok {
+				return err
+			}
+			if err := hsm.Retarget(dst, g.Size, g.Name, blocksHashOf(g), g.ModTime()); err != nil {
+				return err
+			}
+			src, bh, known, record = g, blocksHashOf(g), true, false
+			continue
+		}
+		if _, ok := f.supersededBy(name, dst, bh); !ok {
+			return err
+		}
+	}
+}
+
+// switchPlaceholder makes the placeholder dst stand for file, the newer
+// global version of name, and records that in the index, as the puller
+// would have: whether the content then arrives or not, the index describes
+// what is on disk. recorded is false if dst was no longer at name.
+func (f *sendReceiveFolder) switchPlaceholder(name string, dst *os.File, file protocol.FileInfo) (recorded bool, _ error) {
+	f.od.indexMut.Lock()
+	defer f.od.indexMut.Unlock()
+	if err := hsm.Retarget(dst, file.Size, file.Name, blocksHashOf(file), file.ModTime()); err != nil {
+		return false, err
+	}
+	if !f.isFileAt(name, dst) {
+		return false, nil // replaced meanwhile; that replacement is recorded
+	}
+	file.LocalFlags = f.localFlags | protocol.FlagLocalVirtual
+	file.Sequence = 0
+	return true, f.updateLocals([]protocol.FileInfo{file})
+}
+
+// awaitPlaceholderSource waits a little for the index to learn about the
+// placeholder dst.
+func (f *sendReceiveFolder) awaitPlaceholderSource(ctx context.Context, name, origin string, bh []byte, dst *os.File) (protocol.FileInfo, bool) {
+	select {
+	case f.od.flushPuller <- struct{}{}:
+	default:
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && !hsm.Unlinked(dst) {
+		select {
+		case <-ctx.Done():
+			return protocol.FileInfo{}, false
+		case <-time.After(20 * time.Millisecond):
+		}
+		if src, ok := f.placeholderSource(name, origin, bh); ok {
+			return src, true
+		}
+	}
+	return protocol.FileInfo{}, false
+}
+
+// newerGlobalWait bounds how long a read waits for a peer to announce the
+// version that replaced the one it no longer has. Peers rescan such a file
+// at once, but there may be no newer version at all (e.g. the peer lost a
+// conflict and moved its copy away).
+const newerGlobalWait = 5 * time.Second
+
+// awaitNewerGlobal waits a little for the global version of name to differ
+// from src.
+func (f *sendReceiveFolder) awaitNewerGlobal(ctx context.Context, name string, src protocol.FileInfo) {
+	deadline := time.Now().Add(newerGlobalWait)
+	for time.Now().Before(deadline) {
+		if g, ok, err := f.model.sdb.GetGlobalFile(f.folderID, name); err != nil || !ok || !g.Version.Equal(src.Version) {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// latestGlobal returns the global version of name, if it is a file whose
+// content can be fetched.
+func (f *sendReceiveFolder) latestGlobal(name string) (protocol.FileInfo, bool) {
+	g, ok, err := f.model.sdb.GetGlobalFile(f.folderID, name)
+	if err != nil || !ok || g.IsDeleted() || g.IsInvalid() || g.Type != protocol.FileInfoTypeFile || len(g.Blocks) == 0 && g.Size > 0 {
+		return protocol.FileInfo{}, false
+	}
+	return g, true
+}
+
+// hydrateContent writes the content of src into the placeholder dst and
+// turns it into a normal file.
+func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src protocol.FileInfo, dst *os.File, kind hydrateKind) error {
 	st, err := dst.Stat()
 	if err != nil {
 		return err
@@ -356,10 +591,20 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	if st.Size() != src.Size {
 		return fmt.Errorf("%s: placeholder size %d does not match index size %d: %w", name, st.Size(), src.Size, syscall.EIO)
 	}
-	mtime := st.ModTime()
-
 	started := time.Now()
+	// The modification time from before any content was written, also by
+	// an earlier attempt that was interrupted.
+	mtime, err := hsm.BeginHydration(dst)
+	if err != nil {
+		return err
+	}
 	if err := f.fetchBlocks(ctx, name, src, dst); err != nil {
+		// Leave the placeholder exactly as it was: writing the blocks we
+		// got bumped its modification time, which the scanner would take
+		// for a local change and announce as a new version.
+		if derr := hsm.Discard(dst); derr != nil {
+			f.sl.Warn("Failed to reset placeholder after failed hydration", slogutil.FilePath(name), slogutil.Error(derr))
+		}
 		return err
 	}
 	// The content must be durable before the index says it is local.
@@ -379,20 +624,49 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	f.model.hsmUnmark(dst)
 
 	// The file is complete and durable, so the application can go on. The
-	// index update is batched: doing it inline costs a database transaction
-	// and event bus round trips per file, which dominated the latency of
-	// opening many small files. If we crash before the batch is committed,
-	// the scanner notices that the file is no longer a placeholder and
-	// fixes the index (see walker.walkRegular).
-	f.od.hydratedMut.Lock()
-	f.od.hydrated[name] = blocksHashOf(src)
-	f.od.hydratedMut.Unlock()
-	select {
-	case f.od.hydratedC <- struct{}{}:
-	default:
-	}
+	// index update is batched by the caller: doing it inline costs a
+	// database transaction and event bus round trips per file, which
+	// dominated the latency of opening many small files. If we crash before
+	// the batch is committed, the scanner notices that the file is no
+	// longer a placeholder and fixes the index (see walker.walkRegular).
 	f.sl.Debug("Hydrated file", slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
 	return nil
+}
+
+// supersededBy returns the global version of name if it replaces the
+// content of the placeholder dst (blocks hash bh) and nothing local stands
+// in the way: dst is the file at name, it is the local version, and that
+// is unmodified and older than the global one. The placeholder must also
+// be able to take the global version's place as is (same permissions);
+// otherwise it is left to the puller.
+func (f *sendReceiveFolder) supersededBy(name string, dst *os.File, bh []byte) (protocol.FileInfo, bool) {
+	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
+	if err != nil || !ok || !cur.IsVirtual() || !bytes.Equal(blocksHashOf(cur), bh) {
+		return protocol.FileInfo{}, false
+	}
+	g, ok := f.latestGlobal(name)
+	if !ok {
+		return protocol.FileInfo{}, false
+	}
+	if bytes.Equal(blocksHashOf(g), bh) || g.Version.Equal(cur.Version) || !g.Version.GreaterEqual(cur.Version) {
+		return protocol.FileInfo{}, false
+	}
+	if !f.IgnorePerms && !g.NoPermissions && g.Permissions&0o777 != cur.Permissions&0o777 {
+		return protocol.FileInfo{}, false
+	}
+	if !f.isFileAt(name, dst) {
+		return protocol.FileInfo{}, false
+	}
+	return g, true
+}
+
+func (f *sendReceiveFolder) isFileAt(name string, fd *os.File) bool {
+	a, err := fd.Stat()
+	if err != nil {
+		return false
+	}
+	b, err := os.Lstat(f.absPath(name))
+	return err == nil && os.SameFile(a, b)
 }
 
 // hydratedCommitDelay batches index updates for hydrated files. Tests can
@@ -433,6 +707,8 @@ func (f *sendReceiveFolder) commitHydrated() error {
 		return nil
 	}
 
+	f.od.indexMut.Lock()
+	defer f.od.indexMut.Unlock()
 	batch := make([]protocol.FileInfo, 0, len(pending))
 	var bytes_ int64
 	for name, bh := range pending {
@@ -632,7 +908,26 @@ func (b *evictBatch) flush() error {
 	if len(b.pending) == 0 {
 		return nil
 	}
-	err := b.f.updateLocals(b.pending)
+	f := b.f
+	f.od.indexMut.Lock()
+	defer f.od.indexMut.Unlock()
+	// Drop files replaced since they were evicted: their new index entry
+	// may already be committed.
+	valid := b.pending[:0]
+	for _, fi := range b.pending {
+		cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, fi.Name)
+		if err != nil {
+			return err
+		}
+		if !ok || !cur.Version.Equal(fi.Version) || !bytes.Equal(blocksHashOf(cur), blocksHashOf(fi)) {
+			continue
+		}
+		if _, bh, ph := hsm.ReadPlaceholder(f.absPath(fi.Name)); !ph || !bytes.Equal(bh, blocksHashOf(fi)) {
+			continue
+		}
+		valid = append(valid, fi)
+	}
+	err := f.updateLocals(valid)
 	b.pending = b.pending[:0]
 	return err
 }
@@ -672,24 +967,14 @@ func (f *sendReceiveFolder) evictFile(name string, verify bool) (_ protocol.File
 		return cur, false, fmt.Errorf("%s: %w", name, errNoOtherCopy)
 	}
 
-	fd, restore, err := hsm.OpenPathForWrite(f.absPath(name))
+	err = f.model.hsmEvict(f.folderID, name, cur, func(fd *os.File) error {
+		if err := f.verifyAgainstIndex(fd, cur, verify); err != nil {
+			f.ScheduleForceRescan(name)
+			return err
+		}
+		return nil
+	})
 	if err != nil {
-		return cur, false, err
-	}
-	defer fd.Close()
-	defer restore()
-	// While the lease is held nobody else can open the file, so nothing can
-	// change it between the check below and the eviction.
-	if err := hsm.Lease(fd); err != nil {
-		return cur, false, fmt.Errorf("%s: %w", name, err)
-	}
-	defer hsm.Unlease(fd) //nolint:errcheck
-
-	if err := f.verifyAgainstIndex(fd, cur, verify); err != nil {
-		f.ScheduleForceRescan(name)
-		return cur, false, fmt.Errorf("%s: %w", name, err)
-	}
-	if err := f.model.hsmMakePlaceholder(fd, cur); err != nil {
 		return cur, false, fmt.Errorf("%s: %w", name, err)
 	}
 

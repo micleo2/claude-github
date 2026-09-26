@@ -1808,7 +1808,9 @@ func (f *sendReceiveFolder) dbUpdaterRoutine(dbUpdateChan <-chan dbUpdateJob) in
 
 		// All updates to file/folder objects that originated remotely
 		// (across the network) use this call to updateLocals
+		f.od.indexMut.Lock()
 		f.updateLocalsFromPulling(files)
+		f.od.indexMut.Unlock()
 
 		if found {
 			f.ReceivedFile(lastFile.Name, lastFile.IsDeleted())
@@ -1850,6 +1852,9 @@ loop:
 			changed++
 
 		case <-tick.C:
+			batch.Flush()
+
+		case <-f.od.flushPuller:
 			batch.Flush()
 		}
 	}

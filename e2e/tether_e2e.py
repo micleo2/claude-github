@@ -18,6 +18,7 @@ import json
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -1114,6 +1115,61 @@ def other_mount_namespace_hydrates(c):
     for rel, p in zip(rels, (copy, bind, lower, ro, after)):
         assert p.returncode == 0 and p.stdout.split()[0] == sha(FILES[rel]), (rel, p.stdout, p.stderr)
         assert not n.is_placeholder(rel), rel
+
+
+@test
+def superseded_placeholder_hydrates_latest(c):
+    """Reading a placeholder whose version the server has replaced, before the puller caught up, gets the new content without a conflict."""
+    n = c.c1
+    rel = "superseded.bin"
+    FILES[rel] = random.Random(81).randbytes(300 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    before = n.db_file(rel)["local"]
+    # Hold the puller back so that the placeholder stays at the old version.
+    set_folder(n, pullerDelayS=300)
+    try:
+        time.sleep(2)
+        FILES[rel] = random.Random(82).randbytes(310 * 1024)
+        c.write_server(rel, FILES[rel])
+        wait_for(lambda: n.db_file(rel)["global"]["version"] != before["version"], 30, what="new version announced")
+        assert n.is_placeholder(rel) and n.db_file(rel)["local"]["version"] == before["version"]
+        assert n.view_sha(rel) == sha(FILES[rel]), "must hydrate the new version"
+        f = n.db_file(rel)
+        assert f["local"]["version"] == f["global"]["version"], f
+        wait_for(lambda: not n.db_file(rel)["local"]["localFlags"] & 128, 10, what="hydration committed")
+        assert os.stat(n.lower(rel)).st_size == len(FILES[rel])
+    finally:
+        set_folder(n, pullerDelayS=1)
+    time.sleep(3)
+    conflicts = [x for x in os.listdir(c.server.lower()) + os.listdir(n.lower()) if x.startswith("superseded.sync-conflict")]
+    assert not conflicts, conflicts
+    with open(c.server.lower(rel), "rb") as fh:
+        assert sha(fh.read()) == sha(FILES[rel]), "server content must be unchanged"
+
+
+@test
+def interrupted_hydration_is_reset(c):
+    """A placeholder left mid-hydration (crash) gets its mtime back and does not announce a new version."""
+    n = c.c1
+    rel = "interrupted.bin"
+    FILES[rel] = random.Random(83).randbytes(200 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    before = n.db_file(rel)["local"]
+    path = n.lower(rel)
+    st = os.stat(path)
+    # What a crash mid-hydration leaves behind: the marker holding the
+    # original mtime, and a modification time bumped by the writes.
+    os.setxattr(path, "user.tether.hydrating", struct.pack("<Q", st.st_mtime_ns), follow_symlinks=False)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + 5_000_000_000), follow_symlinks=False)
+    n.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={urllib.request.quote(rel)}")
+    wait_for(lambda: os.stat(path).st_mtime_ns == st.st_mtime_ns, 30, what="mtime restored")
+    assert "user.tether.hydrating" not in os.listxattr(path, follow_symlinks=False)
+    assert n.is_placeholder(rel)
+    time.sleep(2)
+    assert n.db_file(rel)["local"]["version"] == before["version"], "no new version for a reset placeholder"
+    assert n.view_sha(rel) == sha(FILES[rel])
 
 
 @test
