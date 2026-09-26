@@ -188,6 +188,21 @@ follows restoring the recorded mtime, and any later write changes it.
 | Cold `git status` | 54.6 s | **9.6–15 s** |
 | Warm `git status` | 0.5 s | 0.2–0.5 s |
 
+**Where the time goes now.** A CPU profile during a cold read of the whole tree: the daemon uses 2.3 cores.
+- About a quarter is `fsync`. It's off the application's path, but CPU-heavy on btrfs.
+- About a quarter is SQLite, and 2.1 of 23 CPU seconds went to opening database connections. The folder database
+  kept 4 idle connections, and every lookup beyond that opened and closed its own. It now keeps 16 (2 MB page cache
+  each).
+- One lookup per hydration was repeated (the superseded check); the entry is now reused.
+
+**Measurement notes:**
+- **Batched durability doesn't help here.** One `syncfs` per 20 ms batch in place of per-file `fsync` changed nothing
+  measurable, and `syncfs` flushes the whole filesystem, which would interfere with the user's other writes. It is
+  not used.
+- **Runs back to back alternate** between about 9.5 s and 14.5 s. btrfs commits a transaction every 30 s, and a run
+  that overlaps the commit of the previous eviction (19,816 truncations) is slower. With 31 s between runs the cold
+  read is 9.3–10.2 s with sibling prefetch and 12.9–14.5 s without it, so prefetch pays off on a LAN too.
+
 The remaining per-file cost is the fetch itself, and the first file of each directory still waits for a full round
 trip. Crawler-aware prefetch ([docs/design/crawler-prefetch.md](../design/crawler-prefetch.md)) is the next lever.
 

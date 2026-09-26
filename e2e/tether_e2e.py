@@ -169,6 +169,10 @@ class Node:
         except OSError:
             return False
 
+    def wait_local(self, rel, timeout=10):
+        """Wait until rel is no longer a placeholder (downloads are made durable in the background)."""
+        wait_for(lambda: not self.is_placeholder(rel), timeout, what=f"{rel} local on {self.name}")
+
     def allocated(self, rel):
         return os.lstat(self.lower(rel)).st_blocks * 512
 
@@ -295,7 +299,7 @@ def read_hydrates(c):
     """Reading through the view returns the right content and makes the file local."""
     for rel in ("small.txt", "big.bin", "dir/ü naïve.txt", "sparse.bin"):
         assert c.c1.view_sha(rel) == sha(FILES[rel]), rel
-        assert not c.c1.is_placeholder(rel), rel
+        c.c1.wait_local(rel)
     st = c.c1.status()
     assert st["big.bin"]["state"] == "local", st["big.bin"]
     # mtime survived hydration
@@ -586,7 +590,7 @@ def mmap_odirect_pread(c):
         else:
             out = c.c2.sh(f"/opt/tether/probe {mode} '{VIEW}/{rel}'").stdout.strip()
             assert out == sha(FILES[rel]), mode
-        assert not c.c2.is_placeholder(rel), mode
+        c.c2.wait_local(rel)
 
 
 @test
@@ -875,8 +879,10 @@ def prefetched_unused_files_are_evicted_first(c):
     set_folder(n, cacheBudget={"value": 150_000, "unit": ""})
     try:
         assert n.view_sha(names[0]) == sha(FILES[names[0]])  # used; siblings get prefetched
+        n.wait_local(names[0])
         wait_for(lambda: n.is_placeholder(names[1]) and n.is_placeholder(names[2]), 30,
                  what="prefetched siblings evicted by the budget")
+        time.sleep(2)  # more maintenance rounds
         assert not n.is_placeholder(names[0]), "the file that was opened must stay"
     finally:
         set_folder(n, cacheBudget={"value": 0, "unit": ""})
@@ -1080,7 +1086,7 @@ def crash_before_hydration_commit(c):
     c.wait_placeholder(n, rel)
     version = n.db_file(rel)["local"]["version"]
     assert n.view_sha(rel) == sha(FILES[rel])
-    assert not n.is_placeholder(rel)
+    n.wait_local(rel)
     assert n.db_file(rel)["local"]["localFlags"] & 128, "commit should still be pending"
     run("docker", "kill", n.container)
     n.start()

@@ -28,6 +28,14 @@ const (
 	// connection close.
 	maxIdleConns = 4
 
+	// folderMaxIdleConns is higher: on-demand folders look up files from
+	// many goroutines at once (a hydration per opened file, and prefetch
+	// workers), and a connection opened beyond the idle ones is closed
+	// again right after, which cost more than the lookups themselves (2.1
+	// of 23 CPU seconds while reading the V8 tree cold). Each idle
+	// connection keeps its page cache (2 MB by default).
+	folderMaxIdleConns = 16
+
 	minDeleteRetention = 24 * time.Hour
 )
 

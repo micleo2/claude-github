@@ -272,6 +272,13 @@ func (f *sendReceiveFolder) writePlaceholder(file protocol.FileInfo, dbUpdateCha
 // content a placeholder stands for. The placeholder may have been moved, in
 // which case its origin name differs from its current name.
 func (f *sendReceiveFolder) placeholderSource(name, origin string, bh []byte) (protocol.FileInfo, bool) {
+	src, _, ok := f.placeholderSourceLocal(name, origin, bh)
+	return src, ok
+}
+
+// placeholderSourceLocal is placeholderSource, and also reports whether the
+// entry found is the local one of name itself.
+func (f *sendReceiveFolder) placeholderSourceLocal(name, origin string, bh []byte) (_ protocol.FileInfo, isLocal, ok bool) {
 	names := []string{name}
 	if origin != "" && origin != name {
 		names = append(names, origin)
@@ -284,13 +291,13 @@ func (f *sendReceiveFolder) placeholderSource(name, origin string, bh []byte) (p
 	}
 	for _, n := range names {
 		if fi, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, n); err == nil && ok && matches(fi) {
-			return fi, true
+			return fi, n == name, true
 		}
 		if fi, ok, err := f.model.sdb.GetGlobalFile(f.folderID, n); err == nil && ok && matches(fi) {
-			return fi, true
+			return fi, false, true
 		}
 	}
-	return protocol.FileInfo{}, false
+	return protocol.FileInfo{}, false, false
 }
 
 // placeholderChecker lets the scanner recognise placeholders.
@@ -481,7 +488,7 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	f.setHydrating(name, true)
 	defer f.setHydrating(name, false)
 
-	src, known := f.placeholderSource(name, origin, bh)
+	src, srcIsLocal, known := f.placeholderSourceLocal(name, origin, bh)
 	if !known && origin == name && !hsm.Unlinked(dst) {
 		// The puller records the placeholders it creates in batches, up
 		// to two seconds later.
@@ -493,7 +500,14 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	for attempt := 0; ; attempt++ {
 		err := fmt.Errorf("%s: %w", name, errNoPlaceholderSource)
 		if known {
-			if newer, ok := f.supersededBy(name, dst, bh); ok && record {
+			superseded := f.supersededBy
+			if srcIsLocal && attempt == 0 {
+				// Saves looking up the same index entry again.
+				superseded = func(name string, dst *os.File, bh []byte) (protocol.FileInfo, bool) {
+					return f.supersededFrom(name, dst, src, bh)
+				}
+			}
+			if newer, ok := superseded(name, dst, bh); ok && record {
 				// The placeholder stands for a version that has been
 				// replaced; the puller just has not caught up yet. Peers
 				// may no longer have the old content. Nothing of it was
@@ -799,7 +813,16 @@ func (f *sendReceiveFolder) recordHydrated(name string, bh []byte) {
 // otherwise it is left to the puller.
 func (f *sendReceiveFolder) supersededBy(name string, dst *os.File, bh []byte) (protocol.FileInfo, bool) {
 	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
-	if err != nil || !ok || !cur.IsVirtual() || !bytes.Equal(blocksHashOf(cur), bh) {
+	if err != nil || !ok {
+		return protocol.FileInfo{}, false
+	}
+	return f.supersededFrom(name, dst, cur, bh)
+}
+
+// supersededFrom is supersededBy with the local index entry of name, cur,
+// already at hand.
+func (f *sendReceiveFolder) supersededFrom(name string, dst *os.File, cur protocol.FileInfo, bh []byte) (protocol.FileInfo, bool) {
+	if !cur.IsVirtual() || !bytes.Equal(blocksHashOf(cur), bh) {
 		return protocol.FileInfo{}, false
 	}
 	g, ok := f.latestGlobal(name)
@@ -1345,6 +1368,8 @@ func (f *sendReceiveFolder) scheduleOnDemandMaintenance() {
 
 // OnDemandStatus lists files under prefix with their on-demand state.
 func (f *sendReceiveFolder) onDemandStatus(prefix string) ([]OnDemandFileState, error) {
+	// Downloads still being made durable count as local here.
+	f.awaitFinishing(5 * time.Second)
 	if err := f.commitHydrated(); err != nil {
 		return nil, err
 	}
@@ -1368,6 +1393,8 @@ func (f *sendReceiveFolder) onDemandStatus(prefix string) ([]OnDemandFileState, 
 // evictPrefix evicts all unpinned local files under prefix; verify re-reads
 // each one first (see verifyAgainstIndex).
 func (f *sendReceiveFolder) evictPrefix(prefix string, verify bool) (int, error) {
+	// Downloads still being made durable count as local here.
+	f.awaitFinishing(5 * time.Second)
 	if err := f.commitHydrated(); err != nil {
 		return 0, err
 	}
