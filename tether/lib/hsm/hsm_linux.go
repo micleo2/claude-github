@@ -397,11 +397,12 @@ func ReadPlaceholderFile(f *os.File) (origin string, blocksHash []byte, isPlaceh
 	return origin, blocksHash, true
 }
 
-// Finish completes a hydration: the placeholder attributes are removed and
-// the modification time is reset to mtime (writing the content bumped it).
-func Finish(f *os.File, mtime time.Time) error {
+// Finish completes a hydration: the placeholder attributes are removed, the
+// modification time is reset to mtime (writing the content bumped it) and
+// the access time set to atime.
+func Finish(f *os.File, mtime, atime time.Time) error {
 	fd := int(f.Fd())
-	ts := []unix.Timespec{unix.NsecToTimespec(time.Now().UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
+	ts := []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
 		return err
 	}

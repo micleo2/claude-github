@@ -93,6 +93,17 @@ budget.
 Suggested order: **1 + 2** first (a scheduler plus sibling prefetch covers most real workloads), then **4** as an
 opt-in policy, then **3**. #6 only if WAN use matters.
 
+**Status:** #1 and #2 are implemented (`tether/lib/model/folder_prefetch.go`). The e2e benchmark routes one client
+through a 20 ms round-trip-time proxy and runs `grep -r` over 300 small online-only files in 10 directories:
+
+| Prefetch | Time |
+|---|---|
+| Off | 9.2–9.4 s |
+| On | 1.9–2.3 s (4–5×) |
+
+What remains is roughly one full fetch for the first file of each directory, plus files the application reaches
+before their prefetch finishes.
+
 **Caveats to design for:**
 - **Prefetch costs resources.** It wastes bandwidth and disk, so every prefetch must respect the cache budget and a
   per-directory cap.

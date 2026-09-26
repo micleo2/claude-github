@@ -89,7 +89,7 @@ func (h hsmHandler) Hydrate(ctx context.Context, folder, name string, f *os.File
 	if err != nil {
 		return err
 	}
-	return sr.hydrate(ctx, name, f)
+	return sr.hydrate(ctx, name, f, hydrateDemand)
 }
 
 func (m *model) hydrationPolicy(folder string, _ int, exe string) syscall.Errno {

@@ -41,7 +41,7 @@ func (h *mapHandler) Hydrate(_ context.Context, folder, name string, f *os.File)
 	if _, err := f.WriteAt(d, 0); err != nil {
 		return err
 	}
-	return Finish(f, time.Unix(1700000000, 0))
+	return Finish(f, time.Unix(1700000000, 0), time.Now())
 }
 
 func setup(t *testing.T, h Handler, p Policy) (lower, view string, l *Listener) {

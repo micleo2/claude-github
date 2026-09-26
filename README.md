@@ -80,7 +80,15 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
   - the file is open (checked with a write lease), or
   - its content differs from the index, or
   - no other device holds that exact version.
-- **Cache budget:** when local content exceeds the budget, the least recently hydrated unpinned files are evicted.
+- **Sibling prefetch:** when an application opens a placeholder, the small placeholders in the same directory are
+  downloaded in the background by a pool of workers.
+  - **Limits:** direct children only, files ≤ `prefetchMaxFileKiB` (default 256; 0 disables), `prefetchConcurrency`
+    workers (default 16), each directory at most once per 30 s.
+  - **Shared downloads:** an application opening a file that is being prefetched waits for that download rather than
+    starting another.
+  - **Effect:** `grep -r` over 300 online-only files with 20 ms round-trip time went from 9.2 s to 2.3 s.
+- **Cache budget:** when local content exceeds the budget, the least recently used unpinned files are evicted.
+  Prefetched files that nobody opened are evicted first.
 - **Failure handling:**
   - **Offline:** opening a placeholder fails with an error and never returns zeros. Local files keep working.
   - **Peer silently gone:** reads fail after `hydrationTimeoutS` (default 60 s).
@@ -95,7 +103,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 33 end-to-end tests, ~2.5 min
+sudo e2e/run.sh                          # 38 end-to-end tests, ~3.5 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -130,9 +138,9 @@ host's network). Both fail identically on unmodified upstream in this environmen
   The kernel has no pre-content hook for `readdir`/`lookup` yet, so listings can't be populated lazily.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
-- **Small files are fetched one at a time.** About 2.6 ms per file on a LAN (one fetch plus one `fsync`), so latency
-  adds up over thousands of online-only files, especially on high-latency links. Prefetching and pipelining are
-  planned; see [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md).
+- **The first file opened in each directory still waits one full fetch.** Its siblings are prefetched, but tools that
+  touch one file per directory get no benefit. Deeper prefetch (crawler detection, access history) is future work; see
+  [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md).
 - **A metadata-only change to a placeholder can win a conflict against a content change.** This needs the content
   change to carry an *older* mtime. The winning version's content then exists nowhere. The losing content is kept as a
   conflict copy, and the file cannot be hydrated until someone writes it again.

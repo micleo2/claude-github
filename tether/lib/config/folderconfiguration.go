@@ -99,6 +99,10 @@ type FolderConfiguration struct {
 	CacheBudget       Size     `json:"cacheBudget" xml:"cacheBudget" default:"0" restart:"false"`
 	HydrationDenyExes []string `json:"hydrationDenyExes" xml:"hydrationDenyExe" restart:"false"`
 	HydrationTimeoutS int      `json:"hydrationTimeoutS" xml:"hydrationTimeoutS" default:"60" restart:"false"`
+	// When an application opens a placeholder, its sibling placeholders up to
+	// this size are downloaded in the background (0 disables).
+	PrefetchMaxFileKiB  int `json:"prefetchMaxFileKiB" xml:"prefetchMaxFileKiB" default:"256" restart:"false"`
+	PrefetchConcurrency int `json:"prefetchConcurrency" xml:"prefetchConcurrency" default:"16"`
 
 	// Legacy deprecated
 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.

@@ -52,7 +52,7 @@ func (*Listener) Serve(ctx context.Context) error { <-ctx.Done(); return ctx.Err
 func IsVirtual(*os.File) bool                             { return false }
 func ReadPlaceholder(string) (string, []byte, bool)       { return "", nil, false }
 func ReadPlaceholderFile(*os.File) (string, []byte, bool) { return "", nil, false }
-func Finish(*os.File, time.Time) error                    { return errUnsupported }
+func Finish(*os.File, time.Time, time.Time) error         { return errUnsupported }
 func MarkVirtual(*os.File, int64, string, []byte) error   { return errUnsupported }
 func Lease(*os.File) error                                { return errUnsupported }
 func Unlease(*os.File) error                              { return errUnsupported }

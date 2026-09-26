@@ -800,6 +800,148 @@ def cli(c):
     assert p.returncode != 0 and "not inside an on-demand folder" in p.stderr, p.stderr
 
 
+def set_folder(n, **kv):
+    cfg = n.api("GET", f"/rest/config/folders/{FOLDER}")
+    cfg.update(kv)
+    n.api("PUT", f"/rest/config/folders/{FOLDER}", cfg)
+
+
+def make_dir(c, d, count, size, seed):
+    rnd = random.Random(seed)
+    names = []
+    for i in range(count):
+        rel = f"{d}/f{i:03}.txt"
+        FILES[rel] = rnd.randbytes(size)
+        path = c.server.lower(rel)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as f:
+            f.write(FILES[rel])
+        names.append(rel)
+    return names
+
+
+@test
+def sibling_prefetch(c):
+    """Opening one placeholder prefetches its small siblings, not big ones and not subdirectories."""
+    n = c.c1
+    names = make_dir(c, "pf", 40, 2000, 40)
+    big, sub = "pf/big.bin", "pf/sub/deep.txt"
+    FILES[big] = random.Random(41).randbytes(1 * MiB)
+    FILES[sub] = b"deep\n"
+    for rel in (big, sub):
+        os.makedirs(os.path.dirname(c.server.lower(rel)), exist_ok=True)
+        with open(c.server.lower(rel), "wb") as f:
+            f.write(FILES[rel])
+    c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=pf")
+    for rel in names + [big, sub]:
+        c.wait_placeholder(n, rel)
+    assert n.view_sha(names[0]) == sha(FILES[names[0]])
+    wait_for(lambda: not any(n.is_placeholder(r) for r in names), 20, what="siblings prefetched")
+    assert n.is_placeholder(big), "files above prefetchMaxFileKiB are not prefetched"
+    assert n.is_placeholder(sub), "prefetch is not recursive"
+    for rel in names[1:]:
+        with open(n.lower(rel), "rb") as f:
+            assert sha(f.read()) == sha(FILES[rel]), rel
+    st = n.status("pf")
+    assert all(st[r]["state"] == "local" for r in names), "index must agree"
+
+
+@test
+def prefetch_disabled(c):
+    n = c.c2
+    set_folder(n, prefetchMaxFileKiB=0)
+    try:
+        names = make_dir(c, "nopf", 10, 1000, 42)
+        c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=nopf")
+        for rel in names:
+            c.wait_placeholder(n, rel)
+        assert n.view_sha(names[0]) == sha(FILES[names[0]])
+        time.sleep(3)
+        assert all(n.is_placeholder(r) for r in names[1:])
+    finally:
+        set_folder(n, prefetchMaxFileKiB=256)
+
+
+@test
+def prefetched_unused_files_are_evicted_first(c):
+    """Under a cache budget, speculatively fetched files go before files someone actually opened."""
+    n = c.c2
+    names = make_dir(c, "pfbudget", 3, 100_000, 43)
+    c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=pfbudget")
+    for rel in names:
+        c.wait_placeholder(n, rel)
+    n.od("evict", "", expect_error=True)
+    set_folder(n, cacheBudget={"value": 150_000, "unit": ""})
+    try:
+        assert n.view_sha(names[0]) == sha(FILES[names[0]])  # used; siblings get prefetched
+        wait_for(lambda: n.is_placeholder(names[1]) and n.is_placeholder(names[2]), 30,
+                 what="prefetched siblings evicted by the budget")
+        assert not n.is_placeholder(names[0]), "the file that was opened must stay"
+    finally:
+        set_folder(n, cacheBudget={"value": 0, "unit": ""})
+
+
+def set_device_addr(n, other, addr):
+    dev = n.api("GET", f"/rest/config/devices/{other.id}")
+    dev["addresses"] = [addr]
+    n.api("PUT", f"/rest/config/devices/{other.id}", dev)
+
+
+class SlowLink:
+    """Route c2 <-> server through a latency proxy in the server container."""
+
+    def __init__(self, c, one_way_ms):
+        self.c, self.ms = c, one_way_ms
+
+    def __enter__(self):
+        c = self.c
+        c.server.sh(f"/opt/tether/latproxy -listen :22001 -target 127.0.0.1:22000 -delay {self.ms}ms "
+                    ">/tmp/latproxy.log 2>&1 &")
+        set_device_addr(c.c2, c.server, f"tcp://{c.server.container}:22001")
+        set_device_addr(c.server, c.c2, "tcp://127.0.0.1:1")  # the server must not dial c2 directly
+        c.c2.pause(c.server)
+        c.server.api("POST", f"/rest/system/pause?device={c.c2.id}")
+        c.server.api("POST", f"/rest/system/resume?device={c.c2.id}")
+        c.c2.resume(c.server)
+        conn = c.c2.api("GET", "/rest/system/connections")["connections"][c.server.id]
+        assert conn["address"].endswith(":22001"), conn
+        return self
+
+    def __exit__(self, *exc):
+        c = self.c
+        set_device_addr(c.c2, c.server, f"tcp://{c.server.container}:22000")
+        set_device_addr(c.server, c.c2, f"tcp://{c.c2.container}:22000")
+        c.c2.pause(c.server)
+        c.c2.resume(c.server)
+        c.server.sh("pkill latproxy || kill $(pidof latproxy)", check=False)
+
+
+@test
+def prefetch_under_latency(c):
+    """grep -r over online-only files with 20 ms added latency: prefetch vs no prefetch."""
+    n = c.c2
+    dirs, per = (10, 30)
+    results = {}
+    for label, maxkib in (("off", 0), ("on", 256)):
+        set_folder(n, prefetchMaxFileKiB=maxkib)
+        root = f"lat-{label}"
+        for d in range(dirs):
+            make_dir(c, f"{root}/d{d}", per, 500, 50 + d)
+        c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={root}")
+        last = f"{root}/d{dirs - 1}/f{per - 1:03}.txt"
+        wait_for(lambda: n.is_placeholder(last) and c.synced(n, last), 120, what=f"{root} placeholders")
+        time.sleep(2)
+        with SlowLink(c, 10):
+            t0 = time.time()
+            out = n.sh(f"grep -rl --binary-files=text . '{VIEW}/{root}' | wc -l").stdout.strip()
+            results[label] = time.time() - t0
+        assert out == str(dirs * per), out
+    set_folder(n, prefetchMaxFileKiB=256)
+    print(f"      grep -r over {dirs * per} files, 20 ms RTT: prefetch off {results['off']:.1f}s, "
+          f"on {results['on']:.1f}s ({results['off'] / results['on']:.1f}x)")
+    assert results["on"] * 2 < results["off"], results
+
+
 @test
 def cache_budget_evicts_lru(c):
     n = c.c2

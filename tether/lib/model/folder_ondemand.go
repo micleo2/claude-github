@@ -69,6 +69,12 @@ type onDemandState struct {
 	hydrated    map[string][]byte // name -> blocks hash
 	hydratedC   chan struct{}
 
+	// One hydration per file at a time; later callers wait for it.
+	flightMut sync.Mutex
+	flights   map[string]*hydrationFlight
+
+	pf prefetchQueue
+
 	mut       sync.Mutex
 	hydrating map[string]struct{}
 	pinKey    string
@@ -82,6 +88,8 @@ func newOnDemandState() *onDemandState {
 		started:   time.Now(),
 		hydrated:  make(map[string][]byte),
 		hydratedC: make(chan struct{}, 1),
+		flights:   make(map[string]*hydrationFlight),
+		pf:        newPrefetchQueue(),
 	}
 }
 
@@ -267,10 +275,68 @@ func (c placeholderChecker) Placeholder(name string) (protocol.FileInfo, bool, b
 
 var _ scanner.PlaceholderChecker = placeholderChecker{}
 
+// hydrateKind says why a file is being hydrated.
+type hydrateKind int
+
+const (
+	hydrateDemand   hydrateKind = iota // an application opened it and is waiting
+	hydrateExplicit                    // pin or API request
+	hydratePrefetch                    // speculative, from the prefetch queue
+)
+
+type hydrationFlight struct {
+	done chan struct{}
+	err  error
+}
+
 // hydrate fetches the content of the placeholder at name and writes it into
 // dst, which may be the fanotify event fd or a file opened through the
-// folder path. On success the file is a normal local file.
-func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.File) error {
+// folder path. On success the file is a normal local file. Concurrent
+// hydrations of the same name share one download.
+func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.File, kind hydrateKind) error {
+	for attempt := 0; attempt < 3; attempt++ {
+		if _, _, ok := hsm.ReadPlaceholderFile(dst); !ok {
+			return nil // already hydrated
+		}
+		f.od.flightMut.Lock()
+		fl, busy := f.od.flights[name]
+		if !busy {
+			fl = &hydrationFlight{done: make(chan struct{})}
+			f.od.flights[name] = fl
+		}
+		f.od.flightMut.Unlock()
+
+		if !busy {
+			if kind == hydrateDemand {
+				f.prefetchSiblings(name)
+			}
+			fl.err = f.hydrateOnce(ctx, name, dst, kind)
+			f.od.flightMut.Lock()
+			delete(f.od.flights, name)
+			f.od.flightMut.Unlock()
+			close(fl.done)
+			return fl.err
+		}
+
+		// Someone else (typically the prefetcher) is on it. Wait, then check
+		// our own file: it may be a different inode (the placeholder was
+		// replaced meanwhile) or the other attempt may have failed.
+		select {
+		case <-fl.done:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		if kind == hydratePrefetch {
+			return nil
+		}
+	}
+	if _, _, ok := hsm.ReadPlaceholderFile(dst); ok {
+		return fmt.Errorf("%s: could not hydrate: %w", name, syscall.EIO)
+	}
+	return nil
+}
+
+func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *os.File, kind hydrateKind) error {
 	origin, bh, ok := hsm.ReadPlaceholderFile(dst)
 	if !ok {
 		return nil // already hydrated
@@ -300,7 +366,14 @@ func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.Fi
 	if err := dst.Sync(); err != nil {
 		return err
 	}
-	if err := hsm.Finish(dst, mtime); err != nil {
+	// Prefetched files get an access time older than their mtime: the cache
+	// budget evicts them first if nobody uses them, and the first real read
+	// refreshes it (relatime updates an atime older than mtime).
+	atime := time.Now()
+	if kind == hydratePrefetch {
+		atime = time.Unix(1, 0)
+	}
+	if err := hsm.Finish(dst, mtime, atime); err != nil {
 		return err
 	}
 
@@ -510,13 +583,13 @@ func (f *sendReceiveFolder) fetchBlock(ctx context.Context, name string, src pro
 
 // hydrateName hydrates a placeholder through the folder path (used for pins
 // and explicit requests, not for application access).
-func (f *sendReceiveFolder) hydrateName(ctx context.Context, name string) error {
+func (f *sendReceiveFolder) hydrateName(ctx context.Context, name string, kind hydrateKind) error {
 	fd, err := os.OpenFile(f.absPath(name), os.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return err
 	}
 	defer fd.Close()
-	return f.hydrate(ctx, name, fd)
+	return f.hydrate(ctx, name, fd, kind)
 }
 
 // evict turns a local, fully synced file back into a placeholder.
@@ -638,7 +711,7 @@ func (f *sendReceiveFolder) hydratePinned(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if err := f.hydrateName(ctx, name); err != nil {
+		if err := f.hydrateName(ctx, name, hydrateExplicit); err != nil {
 			f.sl.Warn("Failed to hydrate pinned file", slogutil.FilePath(name), slogutil.Error(err))
 		}
 	}
@@ -708,6 +781,9 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 // onDemandLoop runs periodic maintenance on the folder's own goroutine.
 func (f *sendReceiveFolder) onDemandLoop(ctx context.Context) {
 	go f.hydratedCommitter(ctx)
+	for range max(f.PrefetchConcurrency, 1) {
+		go f.prefetchWorker(ctx)
+	}
 	t := time.NewTicker(onDemandMaintenanceInterval)
 	defer t.Stop()
 	for {
@@ -804,7 +880,7 @@ func (f *sendReceiveFolder) hydratePrefix(ctx context.Context, prefix string) (i
 	var n int
 	var errs []error
 	for _, name := range names {
-		if err := f.hydrateName(ctx, name); err != nil {
+		if err := f.hydrateName(ctx, name, hydrateExplicit); err != nil {
 			errs = append(errs, err)
 			continue
 		}
