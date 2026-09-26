@@ -500,6 +500,21 @@ func (w *walker) walkRegular(ctx context.Context, relPath string, info fs.FileIn
 			IgnoreOwnership: !w.ScanOwnership,
 			IgnoreXattrs:    !w.ScanXattrs,
 		}) {
+			if curFile.IsVirtual() && w.Placeholders != nil {
+				if _, isPlaceholder, _ := w.Placeholders.Placeholder(relPath); !isPlaceholder {
+					// Hydrated, but the index was not updated (e.g. a
+					// crash before the batched commit). Record that
+					// without creating a new version.
+					curFile.LocalFlags &^= protocol.FlagLocalVirtual
+					l.Debugln(w, "hydrated placeholder:", curFile)
+					select {
+					case finishedChan <- ScanResult{File: curFile}:
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+					return nil
+				}
+			}
 			l.Debugln(w, "unchanged:", curFile)
 			return nil
 		}

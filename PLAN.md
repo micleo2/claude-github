@@ -9,11 +9,13 @@ A Dropbox-like sync tool, Linux server + Linux clients, with:
 - **Selective sync with placeholders.** Every client sees the *whole* tree (names, sizes, mtimes, permissions), but file
   *content* is local only when pinned or recently used. Opening an "online-only" file transparently downloads it.
 - **Plain files on every machine.** The server's store is an ordinary directory tree you can `ls`, `rsync`, back up, serve
-  over Samba, or walk away from. A client's sync root is an ordinary directory on ext4/xfs/btrfs. There is no block store,
+  over Samba, or walk away from. A client's sync root is an ordinary directory. There is no block store,
   no content-addressed object DB, and no custom container format anywhere.
 - **Linux only, on purpose.** We use kernel APIs that cross-platform tools can't rely on: fanotify pre-content (HSM)
-  events, filesystem-wide fanotify change notification, reflinks, hole punching, `renameat2`, `O_TMPFILE`, and btrfs
-  snapshots.
+  events, filesystem-wide fanotify change notification, sparse files, leases, `renameat2` and `O_TMPFILE`.
+- **Generic filesystem APIs only.** No filesystem-specific code or optimizations: no btrfs/ZFS snapshots, reflink
+  ioctls or dedup tools. The only filesystem requirement is the kernel's own opt-in list for pre-content events
+  (currently ext4, xfs and btrfs), which tether does not reference anywhere.
 
 ## 2. Summary of prior art, and what we take from each
 
@@ -25,11 +27,12 @@ A Dropbox-like sync tool, Linux server + Linux clients, with:
 | Selective sync | Ignore patterns only (a file is either fully there or invisible) | Per-library/sub-folder sync; SeaDrive gives on-demand files through FUSE | **Three states per path: ignored / online-only / local, plus an LRU cache budget** |
 | On-demand mechanism | — | FUSE (every I/O goes through userspace) | **fanotify pre-content events (kernel ≥ 6.14 required)** |
 | Change detection | inotify per directory, plus periodic full scans | inotify | **fanotify filesystem/mount marks (no per-directory watch limit)** |
-| History/versioning | Per-folder versioning into `.stversions` | Built into the object model | **btrfs/ZFS snapshots on the server, plus Syncthing-style versioning as a fallback** |
-| Dedup | None | Block-level via CDC | **Reflinks / offline dedup (duperemove) on the server filesystem** |
+| History/versioning | Per-folder versioning into `.stversions` | Built into the object model | **Syncthing's versioning on the server (old versions are plain files too)** |
+| Dedup | None | Block-level via CDC | **Not a goal for now; plain files first** |
 
 **The key point:** Seafile's custom format exists mainly for three things: history, dedup, and cheap snapshots.
-On a Linux server those come from the **filesystem** (btrfs/ZFS/XFS reflinks), so the format isn't needed.
+History is kept as plain-file versions, and dedup is given up for now. Plain files matter more than saving space, so
+the custom format isn't needed.
 What Seafile has that Syncthing lacks is **on-demand files** (SeaDrive). SeaDrive does this with FUSE; we can do it
 with kernel HSM hooks on a real filesystem instead.
 
@@ -68,7 +71,8 @@ allows the access.
 Prior art proving it works: [franzjeger/HydrationAPI](https://github.com/franzjeger/HydrationAPI) implements a
 OneDrive client this way. It passes its invariants on btrfs, ext4, and xfs. Its findings are in Section 4.6.
 
-**No fallback.** Clients must run a kernel with fanotify pre-content support (≥ 6.14) on ext4, xfs or btrfs. On
+**No fallback.** Clients must run a kernel with fanotify pre-content support (≥ 6.14), on a filesystem the kernel
+enables it for. On
 anything else, an on-demand folder refuses to start (it reports a folder error) rather than degrading. A plain
 send-receive folder still works there, but it downloads everything.
 
@@ -77,8 +81,8 @@ send-receive folder still works there, but it downloads everything.
 ```
                         ┌─────────────────────── server (Linux) ───────────────────────┐
                         │ tether (Syncthing fork), folder type = send-receive          │
-                        │ store: /srv/tether/<user>/<folder>  ← plain files on btrfs   │
-                        │ fanotify FS-wide change watcher; btrfs snapshots for history │
+                        │ store: /srv/tether/<user>/<folder>  ← plain files, any fs    │
+                        │ fanotify FS-wide change watcher; versioning as plain files   │
                         └──────────────────────────────▲───────────────────────────────┘
                                                        │ BEP over TLS (unchanged wire protocol + small extensions)
 ┌────────────────────────────── client (Linux) ────────┴───────────────────────────────────────────────┐
@@ -90,7 +94,7 @@ send-receive folder still works there, but it downloads everything.
 │  ├─ NEW: pin/evict/cache-budget manager                 ├─ replies FAN_ALLOW / FAN_DENY(errno)        │
 │  └─ D-Bus + CLI + REST                                  └─ FS-wide change events → forwarded to daemon │
 │                                                                                                      │
-│  ~/Tether  ← bind mount of /var/lib/tether/<user>/root (ext4/xfs/btrfs), only present while hsmd runs │
+│  ~/Tether  ← bind mount of /var/lib/tether/<user>/root, only present while hsmd runs                  │
 └──────────────────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -188,10 +192,9 @@ file.
 |---|---|
 | Scalable change detection (client & server), no `max_user_watches` limit | fanotify `FAN_MARK_FILESYSTEM`/`FAN_MARK_MOUNT` + `FAN_REPORT_DFID_NAME` (replaces Syncthing's inotify watcher; inotify stays as the unprivileged fallback) |
 | Atomic creation / replace of downloaded files | `O_TMPFILE` + `linkat`, `renameat2(RENAME_NOREPLACE / RENAME_EXCHANGE)` |
-| Cheap conflict copies & versioning | `ioctl(FICLONE)` / `copy_file_range` (reflink on btrfs/xfs) |
+| Conflict copies & versioning | `renameat2` where possible, otherwise `copy_file_range` (the kernel may share extents, but nothing depends on it) |
 | Placeholder creation without allocating space | `ftruncate` to size (sparse), `fallocate(PUNCH_HOLE)` to evict |
-| Server history | btrfs subvolume snapshots on a schedule, or per sync batch, exposed as "previous versions" via REST/CLI; ZFS equivalent |
-| Server dedup | reflinks on rename/copy detection; optional `duperemove` |
+| Server history | Syncthing's versioner (staggered/trash-can), exposed as "previous versions" via REST/CLI |
 | Throughput for scanning/hashing | batched `statx`; later `io_uring` for hashing and block serving |
 | Desktop | D-Bus service (`org.tether.Sync1`), `org.freedesktop.Notifications`, Nautilus (`nautilus-python`) and Dolphin overlay plugins that read state via D-Bus / xattr |
 
@@ -231,9 +234,9 @@ hints") are negotiated via a hello option.
 | **2. Virtual folder, metadata only** | Placeholders appear; nothing hydrates yet | Whole tree visible with correct `stat`; zero bytes allocated; server index never corrupted; stock Syncthing peer interop test |
 | **3. hsmd + on-demand hydration** | Open file → content appears | All Phase 0 access paths pass; block hash verification; offline → `EIO`; daemon kill → fail closed; bind-mount guard |
 | **4. Pin / evict / budget** | Dropbox "Make available offline / Online-only" | CLI + REST + D-Bus; LRU eviction under budget; lease-safe eviction; process policy + storm breaker |
-| **5. Local edits on virtual files** | Writes, renames, deletes, atomic-save editors | Rename of placeholder = zero transfer; conflict copies via reflink; fault-injection suite (kill -9 at every step) finds no data loss |
+| **5. Local edits on virtual files** | Writes, renames, deletes, atomic-save editors | Rename of placeholder = zero transfer; conflict copies never lose data; fault-injection suite (kill -9 at every step) finds no data loss |
 | **6. Desktop integration** | File-manager emblems, context menu, notifications | Nautilus + Dolphin plugins, progress notifications for large hydrations |
-| **7. Server features** | History and multi-user | btrfs snapshot versions browsable/restorable; per-user folders owned by the matching Unix user |
+| **7. Server features** | History and multi-user | Plain-file versions browsable/restorable; per-user folders owned by the matching Unix user |
 | **8. Hardening** | Ready for real data | Crash-consistency tests, fuzzing of the hsmd socket protocol, 1M-file / 1 TB benchmarks, upgrade/rollback of the DB schema |
 
 ## 7. Research items from Seafile / SeaDrive
@@ -247,11 +250,12 @@ Read (not copy) these for design lessons:
 - **Seafile's "sync sub-folder" / per-library selective sync UX:** what users actually toggle.
 - **Seafile's FastCDC chunking:** worth considering later as an *index-only* change (content-defined block boundaries in
   the block list for better delta transfer on inserted bytes). Files stay plain. This would be a BEP extension, so defer.
-- **Seafile's server-side history UX:** map it onto btrfs snapshots.
+- **Seafile's server-side history UX:** map it onto Syncthing's versioner.
 
 ## 8. Requirements and constraints
 
-- **Client kernel ≥ 6.14** for fanotify HSM mode, on ext4/xfs/btrfs. That means Fedora 42+, Ubuntu 25.04+/26.04 LTS,
+- **Client kernel ≥ 6.14** for fanotify HSM mode, on a filesystem the kernel enables pre-content events for (ext4,
+  xfs, btrfs today). That means Fedora 42+, Ubuntu 25.04+/26.04 LTS,
   Arch, and similar. Older kernels (e.g. Debian 13, 6.12) are not supported for on-demand folders.
 - `hsmd` needs `CAP_SYS_ADMIN`, because pre-content fanotify groups and mount marks aren't available unprivileged.
   Ship it as a systemd system service with a strict sandbox:
@@ -259,7 +263,7 @@ Read (not copy) these for design lessons:
   - `ProtectSystem=strict`
   - no network access
 - Per-user daemons stay unprivileged and hold all credentials and network access.
-- Server: any Linux filesystem works. btrfs/ZFS/XFS are recommended for snapshots and reflinks.
+- Server: any Linux filesystem works.
 
 ## 9. Risks and open questions
 

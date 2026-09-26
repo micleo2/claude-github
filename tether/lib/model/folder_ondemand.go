@@ -63,6 +63,12 @@ type onDemandState struct {
 	maintenancePending atomic.Bool
 	started            time.Time
 
+	// Hydrated files whose index entries still say "placeholder". They are
+	// committed in batches, off the path of the waiting application.
+	hydratedMut sync.Mutex
+	hydrated    map[string][]byte // name -> blocks hash
+	hydratedC   chan struct{}
+
 	mut       sync.Mutex
 	hydrating map[string]struct{}
 	pinKey    string
@@ -71,7 +77,12 @@ type onDemandState struct {
 }
 
 func newOnDemandState() *onDemandState {
-	return &onDemandState{hydrating: make(map[string]struct{}), started: time.Now()}
+	return &onDemandState{
+		hydrating: make(map[string]struct{}),
+		started:   time.Now(),
+		hydrated:  make(map[string][]byte),
+		hydratedC: make(chan struct{}, 1),
+	}
 }
 
 // FileState is the on-demand state of a single file, as reported by the API.
@@ -293,25 +304,89 @@ func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.Fi
 		return err
 	}
 
-	cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
-	if err == nil && ok && cur.IsVirtual() && bytes.Equal(blocksHashOf(cur), blocksHashOf(src)) {
-		cur.LocalFlags &^= protocol.FlagLocalVirtual
-		cur.Sequence = 0
-		if err := f.updateLocals([]protocol.FileInfo{cur}); err != nil {
-			return err
+	// The file is complete and durable, so the application can go on. The
+	// index update is batched: doing it inline costs a database transaction
+	// and event bus round trips per file, which dominated the latency of
+	// opening many small files. If we crash before the batch is committed,
+	// the scanner notices that the file is no longer a placeholder and
+	// fixes the index (see walker.walkRegular).
+	f.od.hydratedMut.Lock()
+	f.od.hydrated[name] = blocksHashOf(src)
+	f.od.hydratedMut.Unlock()
+	select {
+	case f.od.hydratedC <- struct{}{}:
+	default:
+	}
+	f.sl.Debug("Hydrated file", slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
+	return nil
+}
+
+// hydratedCommitDelay batches index updates for hydrated files. Tests can
+// stretch it (TETHER_HYDRATED_COMMIT_DELAY) to exercise crash recovery.
+var hydratedCommitDelay = func() time.Duration {
+	if d, err := time.ParseDuration(os.Getenv("TETHER_HYDRATED_COMMIT_DELAY")); err == nil {
+		return d
+	}
+	return 100 * time.Millisecond
+}()
+
+func (f *sendReceiveFolder) hydratedCommitter(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done():
+			_ = f.commitHydrated()
+			return
+		case <-f.od.hydratedC:
+		}
+		select {
+		case <-ctx.Done():
+		case <-time.After(hydratedCommitDelay):
+		}
+		if err := f.commitHydrated(); err != nil {
+			f.sl.Warn("Failed to record hydrated files", slogutil.Error(err))
 		}
 	}
-	slog.Info("Hydrated file", f.LogAttr(), slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
+}
+
+// commitHydrated records pending hydrations in the index. Each entry is
+// re-validated: the file may have been replaced or evicted again since.
+func (f *sendReceiveFolder) commitHydrated() error {
+	f.od.hydratedMut.Lock()
+	pending := f.od.hydrated
+	f.od.hydrated = make(map[string][]byte)
+	f.od.hydratedMut.Unlock()
+	if len(pending) == 0 {
+		return nil
+	}
+
+	batch := make([]protocol.FileInfo, 0, len(pending))
+	var bytes_ int64
+	for name, bh := range pending {
+		cur, ok, err := f.model.sdb.GetDeviceFile(f.folderID, protocol.LocalDeviceID, name)
+		if err != nil {
+			return err
+		}
+		if !ok || !cur.IsVirtual() || !bytes.Equal(blocksHashOf(cur), bh) {
+			continue
+		}
+		if _, _, ph := hsm.ReadPlaceholder(f.absPath(name)); ph {
+			continue // evicted again in the meantime
+		}
+		cur.LocalFlags &^= protocol.FlagLocalVirtual
+		cur.Sequence = 0
+		batch = append(batch, cur)
+		bytes_ += cur.Size
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	if err := f.updateLocals(batch); err != nil {
+		return err
+	}
+	slog.Info("Hydrated files", f.LogAttr(), "files", len(batch), "bytes", bytes_)
 	if f.liveConfig().CacheBudget.Value > 0 {
 		f.scheduleOnDemandMaintenance()
 	}
-	f.evLogger.Log(events.ItemFinished, map[string]any{
-		"folder": f.folderID,
-		"item":   name,
-		"error":  nil,
-		"type":   "file",
-		"action": "hydrate",
-	})
 	return nil
 }
 
@@ -567,7 +642,7 @@ func (f *sendReceiveFolder) hydratePinned(ctx context.Context) error {
 			f.sl.Warn("Failed to hydrate pinned file", slogutil.FilePath(name), slogutil.Error(err))
 		}
 	}
-	return nil
+	return f.commitHydrated()
 }
 
 // enforceCacheBudget evicts the least recently accessed unpinned local
@@ -576,6 +651,9 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 	budget := f.liveConfig().CacheBudget
 	if budget.Value <= 0 {
 		return nil
+	}
+	if err := f.commitHydrated(); err != nil {
+		return err
 	}
 	limit := int64(budget.BaseValue())
 	if budget.Percentage() {
@@ -629,6 +707,7 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 
 // onDemandLoop runs periodic maintenance on the folder's own goroutine.
 func (f *sendReceiveFolder) onDemandLoop(ctx context.Context) {
+	go f.hydratedCommitter(ctx)
 	t := time.NewTicker(onDemandMaintenanceInterval)
 	defer t.Stop()
 	for {
@@ -664,6 +743,9 @@ func (f *sendReceiveFolder) scheduleOnDemandMaintenance() {
 
 // OnDemandStatus lists files under prefix with their on-demand state.
 func (f *sendReceiveFolder) onDemandStatus(prefix string) ([]OnDemandFileState, error) {
+	if err := f.commitHydrated(); err != nil {
+		return nil, err
+	}
 	var res []OnDemandFileState
 	pins := f.pinMatcher()
 	err := f.forEachLocal(prefix, func(fi protocol.FileInfo) bool {
@@ -683,6 +765,9 @@ func (f *sendReceiveFolder) onDemandStatus(prefix string) ([]OnDemandFileState, 
 
 // evictPrefix evicts all unpinned local files under prefix.
 func (f *sendReceiveFolder) evictPrefix(prefix string) (int, error) {
+	if err := f.commitHydrated(); err != nil {
+		return 0, err
+	}
 	var names []string
 	pins := f.pinMatcher()
 	if err := f.forEachLocal(prefix, func(fi protocol.FileInfo) bool {
@@ -724,6 +809,9 @@ func (f *sendReceiveFolder) hydratePrefix(ctx context.Context, prefix string) (i
 			continue
 		}
 		n++
+	}
+	if err := f.commitHydrated(); err != nil {
+		errs = append(errs, err)
 	}
 	return n, errors.Join(errs...)
 }

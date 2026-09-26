@@ -87,12 +87,13 @@ class Node:
         os.makedirs(os.path.join(self.mnt, "home"), exist_ok=True)
         self.start()
 
-    def start(self):
+    def start(self, env=()):
         run("docker", "rm", "-f", self.container, check=False)
+        extra = [a for kv in env for a in ("-e", kv)]
         run("docker", "run", "-d", "--privileged", "--name", self.container, "--hostname", self.name,
             "--network", NET, "-p", f"127.0.0.1:{self.port}:8384",
             "-v", f"{self.mnt}:/data", "-v", f"{BIN_DIR}:/opt/tether:ro",
-            "-e", f"STGUIAPIKEY={APIKEY}", "-e", "STNOUPGRADE=1",
+            "-e", f"STGUIAPIKEY={APIKEY}", "-e", "STNOUPGRADE=1", *extra,
             IMAGE, "/opt/tether/syncthing", "serve", "--home", "/data/home", "--no-browser",
             "--gui-address", "http://0.0.0.0:8384", "--no-port-probing")
         st = wait_for(lambda: self.api("GET", "/rest/system/status"), 60, what=f"{self.name} API")
@@ -867,6 +868,31 @@ def crash_unmounts_view_and_recovers(c):
     wait_for(lambda: n.sh(f"grep -q ' {VIEW} ' /proc/self/mountinfo", check=False).returncode == 0, 30,
              what="view remounted")
     assert n.view_sha(rel) == sha(FILES[rel])
+
+
+@test
+def crash_before_hydration_commit(c):
+    """Hydration commits index updates in batches; a crash before the commit is repaired by the scanner."""
+    n = c.c1
+    n.start(env=["TETHER_HYDRATED_COMMIT_DELAY=1h"])
+    wait_for(lambda: n.sh(f"grep -q ' {VIEW} ' /proc/self/mountinfo", check=False).returncode == 0, 30,
+             what="view mounted")
+    rel = "commit-crash.bin"
+    FILES[rel] = random.Random(31).randbytes(300 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    version = n.db_file(rel)["local"]["version"]
+    assert n.view_sha(rel) == sha(FILES[rel])
+    assert not n.is_placeholder(rel)
+    assert n.db_file(rel)["local"]["localFlags"] & 128, "commit should still be pending"
+    run("docker", "kill", n.container)
+    n.start()
+    wait_for(lambda: not n.db_file(rel)["local"]["localFlags"] & 128, 60, what="scanner repaired the index")
+    f = n.db_file(rel)
+    assert f["local"]["version"] == version, "repair must not create a new version"
+    assert f["global"]["version"] == version
+    with open(n.lower(rel), "rb") as fh:
+        assert sha(fh.read()) == sha(FILES[rel])
 
 
 @test

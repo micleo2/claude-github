@@ -32,8 +32,8 @@ Requirements for on-demand folders: Linux ≥ 6.14, and `CAP_SYS_ADMIN` for the 
 and mount marks are privileged). The folder must also be on a filesystem that supports pre-content events:
 - **What decides it:** tether has no filesystem-specific code. The kernel only allows these events on filesystems that
   opt in: ext4 (which also serves ext2/ext3), xfs and btrfs.
-- **Tested:** ext4 and ext2 work. tmpfs, ramfs and overlayfs refuse with `EOPNOTSUPP`. xfs and btrfs were not
-  available to test.
+- **Tested:** ext4, xfs and btrfs pass the kernel-level checks under QEMU on 6.14 and 6.17 (`e2e/vm/run.sh`).
+  tmpfs, ramfs and overlayfs refuse with `EOPNOTSUPP`.
 
 If any requirement is missing, the folder refuses to start and reports an error. It never degrades to placeholders that nothing can fill. The server needs none of this: it holds
 plain files.
@@ -122,8 +122,12 @@ host's network). Both fail identically on unmodified upstream in this environmen
 ## Known limitations
 
 - **Directory listings are materialised.** Every client creates a placeholder for every file. That costs inodes, and
-  on ext4 about one 4 KiB block per placeholder, because the placeholder xattrs don't fit in a 256-byte inode. It costs
-  no data blocks. The kernel has no pre-content hook for `readdir`/`lookup` yet.
+  metadata, but no data blocks. Measured cost per placeholder:
+  - ext4: about 4.1 KB, because the xattrs don't fit in a 256-byte inode
+  - xfs: about 550 B
+  - btrfs: about 1.4 KB
+
+  The kernel has no pre-content hook for `readdir`/`lookup` yet, so listings can't be populated lazily.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
 - **Small files are one round trip each.** About 30 ms per file on a LAN in the tests, so `grep -r` over thousands of
@@ -134,5 +138,5 @@ host's network). Both fail identically on unmodified upstream in this environmen
 - **Ignore patterns (`.stignore`)** are not tested with on-demand folders and not supported there.
 - **Privileges.** The daemon runs with `CAP_SYS_ADMIN`. The split into a small privileged helper and an unprivileged
   sync daemon (PLAN.md §4.6) is not implemented yet.
-- **Only ext4 has been exercised end to end.** xfs and btrfs support the kernel mechanism but were not available in the
-  test environment.
+- **Only ext4 has been exercised end to end.** xfs and btrfs pass the kernel-level checks under QEMU, but the
+  multi-node suite has only run on ext4.
