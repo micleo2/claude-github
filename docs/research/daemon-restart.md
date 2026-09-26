@@ -119,9 +119,35 @@ the service, and a reboot.
   `Close` takes. A closing listener therefore never takes an event, and never answers after close.
 - **Tests:** `TestGroupSurvivesListener`, e2e `crash_keeps_placeholders_guarded`, and the V8 run in §1.
 
-**Next:** C, which closes the full-stop and reboot cases, then D when it lands (it would replace the EIO sweep with
-retries). `chattr +i` on placeholders is a cheap interim step. It doesn't stop zeros being read, but it stops them
-being saved back.
+**tether also implements C** (the placeholder guard, `lib/hsm/bpf/guard.bpf.c`):
+
+- **What it checks:** a sleepable `lsm.s/file_open` program. An open fails with `EIO` when the inode's fsnotify mask
+  lacks `FS_OPEN_PERM` (no group has it marked) **and** the file carries `user.tether.state=virtual`.
+- **Cost for other files:** marked inodes and files with data blocks return before the xattr lookup. 200,000 opens
+  of a small file changed by ±50 ns per open, which is within noise.
+- **Buffer:** the xattr value goes into task-local storage. Dynptrs can't point at the stack, and a per-CPU buffer
+  could be overwritten while the sleepable program sleeps.
+- **Installation:**
+  - The monitor installs it at every start, with only `CAP_SYS_ADMIN`.
+  - It pins it in a bpffs instance that it mounts at `<data dir>/guard`, since `/sys/fs/bpf` is root-only. A mount
+    made by a user service lives in the host's mount namespace, so it survives the service.
+  - Reinstalling pins the new link under a temporary name and renames it over the old pin, so there is no gap. bpffs
+    rejects names containing dots.
+- **Timing:** it takes effect about 1 ms after the group closes (marks are torn down asynchronously), and detaches
+  about 10 ms after its pin is removed.
+- **Results:**
+  - `TestGuard` passes on ext4 and btrfs.
+  - On the V8 client, with `systemctl --user stop`, a shell whose working directory was inside the view got `EIO`
+    instead of zeros, as did reads through the data directory. After a start, the same files downloaded and matched
+    the hub.
+
+**Still open:**
+
+- **Boot:** until tether starts after a reboot, nothing guards placeholders. An early root unit that loads the guard
+  would close that window.
+- **D:** adopt upstream `FAN_CONTROL_FD` when it lands; it would replace the EIO sweep with retries.
+- **`chattr +i`** is not a viable interim step. An immutable file can't be renamed, deleted or chmod'ed, and tether
+  supports those operations on placeholders.
 
 ## Sources
 

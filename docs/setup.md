@@ -119,9 +119,11 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
 
 ## Known rough edges
 
-- **While the daemon is stopped,** placeholders read as zeros through the data directory and through copies of the view
-  that containers or sandboxes still hold. Stop such containers before stopping tether. See
-  [research/placeholder-access-paths.md](research/placeholder-access-paths.md).
+- **While tether is stopped,** the placeholder guard fails opens of online-only files with `EIO`. It needs the bpf LSM
+  (`bpf` listed in `/sys/kernel/security/lsm`); the log says "Placeholder guard active" or explains why not. Without
+  it, placeholders read as zeros while tether is stopped. The guard stays after the service stops. To remove it (e.g.
+  when uninstalling): `rm <data dir>/guard/placeholder-guard && umount <data dir>/guard`. A reboot removes it until
+  tether starts. See [research/daemon-restart.md](research/daemon-restart.md).
 - **Privileges.** With `setcap`, anyone who can run that binary gets `CAP_SYS_ADMIN` in it. The planned fix is a small
   privileged helper plus an unprivileged per-user daemon.
 - **Settings UI.** The GUI has no dedicated on-demand controls. The fields should show up in the folder's *Advanced*

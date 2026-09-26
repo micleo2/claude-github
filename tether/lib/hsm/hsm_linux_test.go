@@ -11,6 +11,7 @@ package hsm
 import (
 	"bytes"
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -536,4 +537,64 @@ func TestGroupSurvivesListener(t *testing.T) {
 	if got, err := os.ReadFile(filepath.Join(view, "x")); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("x after resuming: %q, %v", got, err)
 	}
+}
+
+// While a placeholder's inode is unmarked (tether stopped), the guard fails
+// opens with EIO instead of letting them read zeros; marked placeholders and
+// ordinary files are unaffected.
+func TestGuard(t *testing.T) {
+	content := []byte("guarded")
+	h := &mapHandler{data: map[string][]byte{"f/marked": content}}
+	lower, view, l := setup(t, h, nil)
+	dir := filepath.Join(t.TempDir(), "guard")
+	if err := InstallGuard(dir); err != nil {
+		t.Skip(err)
+	}
+	defer unix.Unmount(dir, unix.MNT_DETACH)
+	defer RemoveGuard(dir)
+	// Installing again replaces it.
+	if err := InstallGuard(dir); err != nil {
+		t.Fatal(err)
+	}
+
+	placeholder(t, l, lower, "marked", int64(len(content)))
+	placeholder(t, l, lower, "later", int64(len(content)))
+	placeholder(t, nil, lower, "unmarked", 10)
+	os.WriteFile(filepath.Join(lower, "plain"), []byte("plain"), 0o644)
+
+	if got, err := os.ReadFile(filepath.Join(view, "marked")); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("marked placeholder: %q, %v", got, err)
+	}
+	if _, err := os.ReadFile(filepath.Join(lower, "unmarked")); !errors.Is(err, unix.EIO) {
+		t.Fatalf("unmarked placeholder: %v, want EIO", err)
+	}
+	if got, err := os.ReadFile(filepath.Join(lower, "plain")); err != nil || string(got) != "plain" {
+		t.Fatalf("ordinary file: %q, %v", got, err)
+	}
+	// Tether stops: its marks go with the group, which the kernel tears
+	// down asynchronously.
+	l.Close()
+	start := time.Now()
+	var err error
+	for _, err = os.ReadFile(filepath.Join(lower, "later")); !errors.Is(err, unix.EIO) && time.Since(start) < 2*time.Second; _, err = os.ReadFile(filepath.Join(lower, "later")) {
+		time.Sleep(time.Millisecond)
+	}
+	if !errors.Is(err, unix.EIO) {
+		t.Fatalf("placeholder after the listener closed: %v, want EIO", err)
+	}
+	t.Logf("guarded %v after the listener closed", time.Since(start).Round(time.Millisecond))
+	// Without the guard it would have read zeros. The kernel detaches it
+	// asynchronously too (after an RCU grace period).
+	if err := RemoveGuard(dir); err != nil {
+		t.Fatal(err)
+	}
+	start = time.Now()
+	var got []byte
+	for got, err = os.ReadFile(filepath.Join(lower, "later")); err != nil && time.Since(start) < 5*time.Second; got, err = os.ReadFile(filepath.Join(lower, "later")) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if err != nil || !bytes.Equal(got, make([]byte, len(content))) {
+		t.Fatalf("after removing the guard: %q, %v", got, err)
+	}
+	t.Logf("guard detached %v after removal", time.Since(start).Round(time.Millisecond))
 }

@@ -1,7 +1,8 @@
 # Placeholders read from other mount namespaces: survey, spikes and options
 
-**Status:** option 1 (per-placeholder inode marks) and option 6 (the monitor holds the fanotify group across sync
-process restarts) are implemented; see §8. The guards for a stopped service (options 4 and 5) are not yet.
+**Status:** implemented: option 1 (per-placeholder inode marks, §8), option 6 (the monitor holds the fanotify group,
+§9), and option 4 (the BPF LSM guard for a stopped service; see [daemon-restart.md](daemon-restart.md)). Option 5 is
+not viable (see the table).
 
 Problem: tether marks one mount, the view, with a fanotify mount mark. A mount mark belongs to that one mount. Any copy of
 it in another mount namespace has no mark, and a placeholder read through that copy returns zeros:
@@ -135,7 +136,7 @@ while the marks exist.
 | 2 | **Filesystem mark** on a filesystem dedicated to tether | Yes (spike) | Fails open once the mark vanishes | Needs a partition, LV or loop image. On a shared filesystem, every open on it would go to the daemon. |
 | 3 | **FUSE with passthrough** | Yes, by construction | Fails closed: `ENOTCONN` for the whole folder, including local files | Lookup/getattr/readdir go through the daemon; restart needs fd handoff (EdenFS, CernVM-FS, Nydus); gives up "plain files on a plain filesystem" |
 | 4 | **Guard: pinned BPF LSM program** that denies opening placeholder-tagged inodes except through the daemon | Yes | **Fails closed** while the program stays pinned | Kernel must run the bpf LSM (Arch, Fedora, Debian 13 here; not Ubuntu by default); no prior art |
-| 5 | **Guard: `chattr +i` on placeholders** | Stops writing back, not reading zeros | Blocks writing, deleting and renaming onto the file, so zeros can't be saved back | Daemon needs `CAP_LINUX_IMMUTABLE` and clears the flag before hydrating |
+| 5 | **Guard: `chattr +i` on placeholders** | Stops writing back, not reading zeros | Blocks writing, deleting and renaming onto the file, so zeros can't be saved back | **Not viable:** an immutable file also can't be renamed, deleted, chmod'ed or have its xattrs changed, and tether supports all of these on placeholders without downloading them |
 | 6 | **Monitor holds the fanotify group** across daemon restarts | – | Marks survive a crash, so no re-marking and no gap | Events being handled at the moment of the crash hang, killably, until restartable events land upstream [41] |
 | 7 | **Placeholder under another name** (suffix file, broken symlink as in git-annex) | Yes | Fails closed by construction | Not transparent; defeats tether's purpose |
 
@@ -178,8 +179,8 @@ tether has to earn correctness at the first-access boundary, and the per-placeho
    - Create each placeholder under a temporary name, mark it, then rename it into place.
 2. **Let the monitor process hold the fanotify group** (option 6), so a crash-restart keeps the marks. Adopt
    `FAN_CONTROL_FD` when it lands.
-3. **Always set `chattr +i` on placeholders** (option 5), so zeros can never be saved back. **Add the BPF LSM guard**
-   (option 4) where the bpf LSM is active, so boot and a stopped service fail closed.
+3. **Add the BPF LSM guard** (option 4) where the bpf LSM is active, so a stopped service fails closed. (`chattr +i`,
+   option 5, turned out not to be viable; see the table.)
 4. **Reduce the mark count:** download small files eagerly. A placeholder on ext4 already takes about 4 KB, so it saves
    nothing for small files. Measure memory on a real large tree before promising million-file trees.
 

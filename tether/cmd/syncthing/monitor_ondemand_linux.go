@@ -52,3 +52,14 @@ func onDemandGroup() *os.File {
 	}
 	return os.NewFile(uintptr(fd), "fanotify-group")
 }
+
+// installOnDemandGuard keeps placeholders from reading as zeros while tether
+// is stopped (hsm.InstallGuard); the group only covers the time it runs.
+func installOnDemandGuard() {
+	dir := filepath.Join(filepath.Dir(locations.Get(locations.OnDemandData)), "guard")
+	if err := hsm.InstallGuard(dir); err != nil {
+		slog.Warn("Placeholder guard unavailable: online-only files read as zeros while tether is stopped", slogutil.Error(err))
+		return
+	}
+	slog.Info("Placeholder guard active", slogutil.FilePath(dir))
+}

@@ -146,12 +146,17 @@ host's network). Both fail identically on unmodified upstream in this environmen
 
 ## Known limitations
 
-- **While tether is stopped, placeholders read as zeros.** Stopping the service, a crash of the monitor process, or a
-  reboot closes the fanotify group, and the marks go with it (they are re-added at startup, 1.5–2.2 s per million).
-  Until then placeholders read as zeros through `path`, through copies of the view held by containers or sandboxes,
-  and from any process whose working directory was inside the view (the view's unmount is lazy). Planned: `chattr +i` on
-  placeholders, and a BPF LSM guard; see
-  [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md).
+- **While tether is stopped, placeholders fail with `EIO`, if the kernel has the bpf LSM.** Stopping the service, a
+  crash of the monitor process, or a reboot closes the fanotify group, and the marks go with it (they are re-added at
+  startup, 1.5–2.2 s per million).
+  - **The guard:** the monitor installs a BPF LSM program that fails opens of unmarked placeholders with `EIO`, from
+    any path. It is pinned in a bpffs mount at `<data dir>/guard`, so it outlives the service. It needs `bpf` in
+    `/sys/kernel/security/lsm` (Arch, Fedora and Debian 13 have it; Ubuntu doesn't by default) and Linux 6.8 or later.
+  - **Without the bpf LSM,** placeholders read as zeros while tether is stopped: through `path`, through copies of the
+    view held by containers or sandboxes, and from any process whose working directory was inside the view.
+  - **After a reboot,** the guard is gone until tether starts again.
+
+  See [docs/research/daemon-restart.md](docs/research/daemon-restart.md).
 - **Kernel memory:** a marked inode can't be evicted, so each online-only file holds about 1.3 KB of kernel memory.
 
 - **Directory listings are materialised.** Every client creates a placeholder for every file. That costs inodes, and

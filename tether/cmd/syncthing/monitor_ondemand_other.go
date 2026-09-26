@@ -13,3 +13,5 @@ import "os"
 func unmountStaleOnDemandViews() {}
 
 func onDemandGroup() *os.File { return nil }
+
+func installOnDemandGuard() {}

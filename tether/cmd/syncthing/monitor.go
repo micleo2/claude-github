@@ -103,6 +103,9 @@ func (c *serveCmd) monitorMain() {
 	// The fanotify group outlives each sync process, so that on-demand
 	// placeholders stay guarded while one restarts (nil if unavailable).
 	group := onDemandGroup()
+	if group != nil {
+		installOnDemandGuard()
+	}
 	exitMonitor := func(code int) {
 		// The group closes with us: nothing guards placeholders any more.
 		unmountStaleOnDemandViews()
