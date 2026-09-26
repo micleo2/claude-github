@@ -14,4 +14,6 @@ func unmountStaleOnDemandViews() {}
 
 func onDemandGroup() *os.File { return nil }
 
+func closeOnDemandGroup(*os.File) {}
+
 func installOnDemandGuard() {}

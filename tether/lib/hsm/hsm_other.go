@@ -63,6 +63,7 @@ func ReadPlaceholder(string) (string, []byte, bool)       { return "", nil, fals
 func ReadPlaceholderFile(*os.File) (string, []byte, bool) { return "", nil, false }
 func Finish(*os.File, time.Time, time.Time) error         { return errUnsupported }
 func BeginHydration(*os.File) (time.Time, error)          { return time.Time{}, errUnsupported }
+func DenyPending(int) int                                 { return 0 }
 func Unlinked(*os.File) bool                              { return false }
 func Ctime(string) (time.Time, error)                     { return time.Time{}, errUnsupported }
 func Interrupted(string) bool                             { return false }

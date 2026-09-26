@@ -213,26 +213,71 @@ func group() (fd int, inherited bool, err error) {
 // event could otherwise share a stale one's number, and an answer meant for
 // it would release the stale one instead.
 func (l *Listener) clearStale() {
+	start := time.Now()
+	n, checked := denyByNumber(l.fd)
+	log := l.log.Debug
+	if n > 0 {
+		log = l.log.Warn
+	}
+	log("Resumed the on-demand group from the previous process; interrupted downloads fail with EIO",
+		"interrupted", n, "checked", checked, "duration", time.Since(start).Round(time.Millisecond))
+}
+
+// denyByNumber fails, with EIO, every permission event of the group that
+// was read but not answered. The kernel matches responses by event fd
+// number only, and the process that read them is gone with their fds, so
+// every possible number is tried.
+func denyByNumber(group int) (denied int, checked uint64) {
 	var rl unix.Rlimit
 	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil || rl.Cur > 1<<22 {
 		rl.Cur = 1 << 22
 	}
 	var r [8]byte
 	binary.LittleEndian.PutUint32(r[4:], responses(unix.EIO)[0])
-	n := 0
-	start := time.Now()
 	for fd := uint64(0); fd < rl.Cur; fd++ {
 		binary.LittleEndian.PutUint32(r[0:], uint32(fd))
-		if _, err := unix.Write(l.fd, r[:]); err == nil {
-			n++
+		if _, err := unix.Write(group, r[:]); err == nil {
+			denied++
 		}
 	}
-	log := l.log.Debug
-	if n > 0 {
-		log = l.log.Warn
+	return denied, rl.Cur
+}
+
+// DenyPending fails, with EIO, every access waiting on the group: queued
+// events and ones read by a process that is gone. Call it before closing
+// the group for good, with no listener running: the kernel allows every
+// pending access when a group closes, and a placeholder then reads as
+// zeros.
+func DenyPending(group int) int {
+	n := 0
+	buf := make([]byte, 64<<10)
+	for {
+		m, err := unix.Read(group, buf)
+		if err != nil || m <= 0 {
+			break
+		}
+		const size = int(unsafe.Sizeof(unix.FanotifyEventMetadata{}))
+		for off := 0; off+size <= m; {
+			md := (*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[off]))
+			if int(md.Event_len) < size {
+				break
+			}
+			if md.Fd >= 0 {
+				if md.Mask&eventMask != 0 {
+					var r [8]byte
+					binary.LittleEndian.PutUint32(r[0:], uint32(md.Fd))
+					binary.LittleEndian.PutUint32(r[4:], responses(unix.EIO)[0])
+					if _, err := unix.Write(group, r[:]); err == nil {
+						n++
+					}
+				}
+				unix.Close(int(md.Fd))
+			}
+			off += int(md.Event_len)
+		}
 	}
-	log("Resumed the on-demand group from the previous process; interrupted downloads fail with EIO",
-		"interrupted", n, "checked", rl.Cur, "duration", time.Since(start).Round(time.Millisecond))
+	denied, _ := denyByNumber(group)
+	return n + denied
 }
 
 // AddView starts serving a folder: it marks every placeholder under

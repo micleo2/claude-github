@@ -51,14 +51,27 @@ sudo setcap cap_sys_admin+ep /usr/local/bin/tether-syncthing
 tether-syncthing serve --home ~/.local/state/tether-client --no-browser
 ```
 
-- **Run it long-term** as a systemd user service with `ExecStart` as above. `loginctl enable-linger` keeps it running
-  without a login session.
+- **Run it long-term** as a systemd user service. `loginctl enable-linger` keeps it running without a login session.
+
+  ```ini
+  [Service]
+  ExecStart=/usr/local/bin/tether-syncthing serve --home %h/.local/state/tether-client --no-browser
+  Restart=on-failure
+  SuccessExitStatus=3 4
+  RestartForceExitStatus=3 4
+  # Keep the fanotify group across a crash of tether itself: accesses to
+  # placeholders wait for the restart instead of reading zeros.
+  FileDescriptorStoreMax=1
+  NotifyAccess=main
+  ```
 - **Coexisting with Syncthing:** if a normal Syncthing already runs on this machine, give tether other ports. Set the
   GUI address in the config (*Settings → GUI*, or `PATCH /rest/config/gui`) rather than with `--gui-address`, which is
   not saved, so the `tether` CLI finds the right daemon. Set the sync port in `listenAddresses`.
 - **Keep the `serve` command.** It runs a small monitor process that owns the fanotify group and restarts the sync
-  process if it crashes; meanwhile accesses to placeholders wait instead of reading zeros. With systemd, stop the
-  service rather than killing processes: stopping it closes the group (see *Known rough edges*).
+  process if it crashes; meanwhile accesses to placeholders wait instead of reading zeros. With the unit above,
+  systemd also keeps a copy of the group, so if the monitor itself dies, accesses wait for the automatic restart.
+  Stopping the service closes the group: downloads in progress fail with `EIO`, and the guard takes over (see *Known
+  rough edges*).
 - **Self-upgrade is compiled out.** Syncthing's release feed would replace tether with stock Syncthing.
 
 ## 4. Pair client and server

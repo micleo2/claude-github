@@ -822,3 +822,53 @@ func TestGuardDuringTeardown(t *testing.T) {
 	}
 	t.Logf("%d of %d opens succeeded around teardown", opened.Load(), attempts.Load())
 }
+
+// Closing a group allows every access still waiting on it; DenyPending fails
+// them instead.
+func TestDenyPending(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	if err := Supported(); err != nil {
+		t.Skip(err)
+	}
+	for _, deny := range []bool{false, true} {
+		g, err := NewGroup()
+		if err != nil {
+			t.Fatal(err)
+		}
+		path := filepath.Join(t.TempDir(), "f")
+		os.WriteFile(path, []byte("x"), 0o644)
+		if err := unix.FanotifyMark(g, unix.FAN_MARK_ADD, unix.FAN_OPEN_PERM, unix.AT_FDCWD, path); err != nil {
+			unix.Close(g)
+			t.Skip(err)
+		}
+		opened := make(chan error, 1)
+		go func() {
+			f, err := os.Open(path)
+			if err == nil {
+				f.Close()
+			}
+			opened <- err
+		}()
+		time.Sleep(100 * time.Millisecond) // the open is waiting
+		select {
+		case err := <-opened:
+			t.Fatalf("open did not wait: %v", err)
+		default:
+		}
+		if deny {
+			if n := DenyPending(g); n != 1 {
+				t.Errorf("denied %d, want 1", n)
+			}
+		}
+		unix.Close(g)
+		err = <-opened
+		if deny && !errors.Is(err, unix.EIO) {
+			t.Fatalf("with DenyPending: %v, want EIO", err)
+		}
+		if !deny && err != nil {
+			t.Fatalf("closing the group should have allowed the open: %v", err)
+		}
+	}
+}

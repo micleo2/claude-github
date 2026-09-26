@@ -159,6 +159,26 @@ the service, and a reboot.
     instead of zeros, as did reads through the data directory. After a start, the same files downloaded and matched
     the hub.
 
+**Also implemented: the group outlives the monitor under systemd** (the service manager's
+[file descriptor store](https://systemd.io/FILE_DESCRIPTOR_STORE/), the documented way to keep an fd across a
+service's restarts):
+- The monitor hands a copy of the group to systemd (`FDSTORE=1`, `FDNAME=tether-hsm-group`; the unit needs
+  `FileDescriptorStoreMax=1` and `NotifyAccess=main`). After a crash, systemd passes the group back (`LISTEN_FDS`,
+  `LISTEN_FDNAMES`) to the restarted monitor.
+- So a `kill -9` of the whole service no longer closes the group: waiting accesses stay blocked, and nothing is
+  allowed through by the kernel. The marks stay too, so the restart does not re-mark anything.
+- The new sync process fails the accesses that were interrupted with `EIO` (the stale-event sweep). New accesses are
+  served.
+- **Measured on the V8 client:** a reader in the middle of hydrating the 36 MB pack got partial data (exit status 0)
+  before this change. Now it gets `EIO` about 0.5 s after the kill, and the next read gets the right content.
+- **An explicit stop** still closes the group; systemd flushes the store once the unit is inactive. The monitor now
+  fails the accesses still waiting first (`hsm.DenyPending`: queued events, plus a sweep for events the exited sync
+  process had read). Otherwise `fanotify_release` would allow them and they would read whatever the placeholder
+  held. Live: a reader mid-download at `systemctl --user stop` got `EIO`, and its partial content was discarded.
+  Test: `TestDenyPending`.
+- **Without systemd, or a kill followed by a stop,** the group dies with the monitor as before, and the guard's
+  limits apply.
+
 **Still open:**
 
 - **Boot:** until tether starts after a reboot, nothing guards placeholders. An early root unit that loads the guard

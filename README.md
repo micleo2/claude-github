@@ -158,9 +158,13 @@ host's network). Both fail identically on unmodified upstream in this environmen
   - **Without the bpf LSM,** placeholders read as zeros while tether is stopped: through `path`, through copies of the
     view held by containers or sandboxes, and from any process whose working directory was inside the view.
   - **After a reboot,** the guard is gone until tether starts again.
-  - **Reads already waiting** for a download when the monitor dies (not the sync process, whose crash keeps the
-    group) are released by the kernel and may return zeros or partial data. So may an open racing the shutdown by
-    microseconds. The kernel answers pending events with "allow" when a group closes.
+  - **Reads already waiting** for a download when the group closes are released by the kernel ("allow") and may return
+    zeros or partial data. So may an open that races the shutdown by microseconds.
+    - **A clean stop avoids this:** the monitor fails them with `EIO` first.
+    - **So does a crash of the sync process:** the monitor keeps the group.
+    - **So does a crash of the monitor under systemd,** with `FileDescriptorStoreMax=1` and `NotifyAccess=main` (see
+      [docs/setup.md](docs/setup.md)): systemd keeps a copy of the group until the service restarts.
+    - **What remains:** the monitor dying without systemd, or a kill followed by a stop.
 
   See [docs/research/daemon-restart.md](docs/research/daemon-restart.md).
 - **Kernel memory:** a marked inode can't be evicted, so each online-only file holds about 1.3 KB of kernel memory.

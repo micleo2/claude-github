@@ -99,15 +99,21 @@ func (c *serveCmd) monitorMain() {
 	sigHup := syscall.Signal(1)
 	signal.Notify(restartSign, sigHup)
 
-	childEnv := childEnv()
 	// The fanotify group outlives each sync process, so that on-demand
 	// placeholders stay guarded while one restarts (nil if unavailable).
+	// (Before childEnv: it takes the group back from the service manager
+	// and removes the variables that pass it.)
 	group := onDemandGroup()
 	if group != nil {
 		installOnDemandGuard()
 	}
+	childEnv := childEnv()
 	exitMonitor := func(code int) {
-		// The group closes with us: nothing guards placeholders any more.
+		// The group closes with us: from now on the guard fails accesses
+		// to placeholders.
+		if group != nil {
+			closeOnDemandGroup(group)
+		}
 		unmountStaleOnDemandViews()
 		os.Exit(code)
 	}
