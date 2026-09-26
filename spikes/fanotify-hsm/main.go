@@ -251,6 +251,11 @@ func fill(group, fd int, path string, haveRange bool, off, count uint64) error {
 		if err != nil && n == 0 {
 			return err
 		}
+		// Never write past the current EOF: the file may have been truncated
+		// since it became a placeholder.
+		if end := b**blockSize + int64(n); end > st.Size {
+			n = int(max(st.Size-b**blockSize, 0))
+		}
 		if _, err := unix.Pwrite(fd, buf[:n], b**blockSize); err != nil {
 			return err
 		}

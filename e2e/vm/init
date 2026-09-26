@@ -1,0 +1,16 @@
+#!/bin/busybox sh
+/bin/busybox --install -s /bin
+export PATH=/bin
+mount -t proc proc /proc; mount -t sysfs sys /sys; mount -t devtmpfs dev /dev; mount -t tmpfs tmp /tmp
+for m in $(cat /modules.order); do insmod /mods/$m 2>/dev/null; done
+echo "kernel $(uname -r)"
+FSLIST=""
+for spec in vda:ext4 vdb:xfs vdc:btrfs; do
+	d=${spec%%:*}; fs=${spec##*:}
+	mkdir -p /mnt/$fs
+	if mount -t $fs /dev/$d /mnt/$fs 2>/dev/null; then FSLIST="$FSLIST $fs"; else echo "RESULT $fs mount FAIL"; fi
+done
+export FSLIST
+sh /test/guest-tests.sh
+sync
+poweroff -f

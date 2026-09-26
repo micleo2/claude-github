@@ -4,6 +4,7 @@
 //	probe mmap FILE
 //	probe odirect FILE
 //	probe pread FILE OFFSET COUNT
+//	probe mkph FILE SIZE   (make a spike-style placeholder: sparse + user.tether.state=virtual)
 package main
 
 import (
@@ -19,6 +20,13 @@ func main() {
 	if len(os.Args) < 3 {
 		fmt.Fprintln(os.Stderr, "usage: probe mmap|odirect|pread FILE [OFFSET COUNT]")
 		os.Exit(2)
+	}
+	if os.Args[1] == "mkph" {
+		if err := mkph(os.Args[2], os.Args[3]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
 	}
 	data, err := read(os.Args[1], os.Args[2], os.Args[3:])
 	if err != nil {
@@ -87,4 +95,28 @@ func read(mode, path string, args []string) ([]byte, error) {
 		return buf[:got], err
 	}
 	return nil, fmt.Errorf("unknown mode %q", mode)
+}
+
+func mkph(path, size string) error {
+	n, err := strconv.ParseInt(size, 10, 64)
+	if err != nil {
+		return err
+	}
+	os.Remove(path)
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	// Same attributes as a real tether placeholder, so disk cost is realistic.
+	for _, xa := range [][2]string{
+		{"user.tether.state", "virtual"},
+		{"user.tether.origin", "some/typical/directory/" + path},
+		{"user.tether.bh", string(make([]byte, 32))},
+	} {
+		if err := syscall.Setxattr(path, xa[0], []byte(xa[1]), 0); err != nil {
+			return err
+		}
+	}
+	return f.Truncate(n)
 }

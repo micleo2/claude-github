@@ -45,3 +45,33 @@ Every access generates `FAN_PRE_ACCESS` with a range. mmap faults ask for the wh
    So once a file is local, the steady-state cost is effectively zero.
 7. Writing through the event fd (opened `FMODE_NONOTIFY`) generates no further events, but it does bump mtime.
    Restore it with `utimensat` after filling.
+
+## Other filesystems and kernels (QEMU, `e2e/vm/run.sh`)
+
+Ubuntu kernels 6.14.0-37 and 6.17.0-40 were booted under QEMU with separate ext4, xfs and btrfs disks.
+
+**What passes on all three filesystems and both kernels:**
+- listener start
+- read, mid-file pread (the file stays sparse), mmap, `O_DIRECT`, io_uring, `cp`, exec of a script
+- truncate, errno propagation, and "no listener reads zeros"
+- the `lib/hsm` tests: lease-based eviction, concurrent openers, policy, view lifecycle
+
+tether has no filesystem-specific code. The kernel decides which filesystems get pre-content events.
+
+| Result | ext4 | xfs | btrfs |
+|---|---|---|---|
+| Access paths above | pass | pass | pass |
+| Disk cost per placeholder (3 xattrs, measured with `df` over 2000) | ~4.1 KB (xattrs spill out of the 256 B inode into one block) | ~550 B (fit in the inode) | ~1.4 KB (metadata) |
+
+On the host kernel (6.18), tmpfs, ramfs and overlayfs refuse pre-content marks with `EOPNOTSUPP`.
+
+**Kernel difference found: exec'ing an ELF binary with range-only hydration.**
+- On **6.14**, the page faults of an exec'd binary's mappings generate **no** pre-content event. The process runs on
+  zero pages and segfaults (exit 139), on every filesystem.
+- On **6.17** the same test passes.
+- The exec open itself does raise `FAN_OPEN_PERM` on both kernels. tether hydrates whole files at open, so it is
+  unaffected (the "full-*" checks pass on 6.14).
+- A future range-hydration mode must therefore either require ≥ 6.17 or hydrate executables fully at open.
+
+(The truncate failure that first showed up in the VM was a spike bug, not a kernel difference: the spike wrote a whole
+64 KiB block past the new EOF. The events for `ftruncate` are identical on 6.14, 6.17 and 6.18.)

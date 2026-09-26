@@ -182,13 +182,25 @@ func TestErrnoPropagates(t *testing.T) {
 func TestPolicyDenies(t *testing.T) {
 	h := &mapHandler{data: map[string][]byte{"f/x": []byte("hi")}}
 	lower, view, _ := setup(t, h, func(folder string, pid int, exe string) unix.Errno {
-		if filepath.Base(exe) == "cat" {
+		if filepath.Base(exe) == "denied-cat" {
 			return unix.EAGAIN
 		}
 		return 0
 	})
 	placeholder(t, filepath.Join(lower, "x"), 2)
-	if out, err := exec.Command("cat", filepath.Join(view, "x")).CombinedOutput(); err == nil {
+	// Run cat from a copy with a distinctive name. Keep argv[0] "cat" so a
+	// multi-call binary such as busybox still acts as cat.
+	catPath, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skip(err)
+	}
+	data, _ := os.ReadFile(catPath)
+	denied := filepath.Join(t.TempDir(), "denied-cat")
+	if err := os.WriteFile(denied, data, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cmd := &exec.Cmd{Path: denied, Args: []string{"cat", filepath.Join(view, "x")}}
+	if out, err := cmd.CombinedOutput(); err == nil {
 		t.Fatalf("cat should have been denied, got %q", out)
 	}
 	if h.calls.Load() != 0 {
