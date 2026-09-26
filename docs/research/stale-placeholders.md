@@ -151,10 +151,12 @@ pre-content events in `do_dentry_open()` (`fsnotify_open_perm_and_set_mode`), *b
 
 ## 5. Remaining gaps
 
-- **Partial placeholders while tether is stopped.** A crash mid-hydration leaves data blocks in a placeholder until
-  the next scan. If tether is stopped entirely, the guard's `i_blocks > 8` fast path lets such a file through, and it
-  reads as a mix of real data and zeros. Closing this means the guard reads the xattr for every unmarked file with
-  blocks, which costs something on every open system-wide. This is not measured yet.
+- ~~Partial placeholders while tether is stopped.~~ **Fixed.** A crash mid-hydration leaves data blocks in a
+  placeholder until the next scan. The guard's fast path took a file with data blocks for an ordinary one, so while
+  tether was stopped such a file read as a mix of real data and zeros. Hydration now sets `chattr +A` (`S_NOATIME`)
+  on the file until it finishes or is discarded (`hsm.BeginHydration`), and the guard reads the xattr of such files
+  despite their blocks. It costs two `ioctl`s per hydration and nothing for other files. If a filesystem refuses the
+  flag, hydration goes on without it. Test: `TestGuard` (ext4, btrfs, xfs).
 - **A different mode or ownership in the new version** is left to the puller (the read fails with EIO, as before).
   Switching could apply them too.
 - **Superseded by a deletion:** the read fails with EIO until the puller deletes the file. File Provider does the same

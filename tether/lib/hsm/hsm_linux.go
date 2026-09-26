@@ -65,6 +65,12 @@ const (
 	XattrPrefix = "user.tether."
 
 	eventMask = unix.FAN_OPEN_PERM | unix.FAN_PRE_ACCESS
+
+	// fsNoatimeFl (chattr +A) is set while content is written into a
+	// placeholder. The guard sees it in the inode (S_NOATIME) without
+	// reading xattrs: a placeholder holding some data, left by a crash
+	// mid-hydration, is still recognised as one while tether is stopped.
+	fsNoatimeFl = 0x80
 )
 
 // Handler supplies file content.
@@ -816,25 +822,51 @@ func ReadPlaceholderFile(f *os.File) (origin string, blocksHash []byte, isPlaceh
 	return origin, blocksHash, true
 }
 
-// BeginHydration records f's modification time in XattrHydrating before
-// content is written into it, and returns it. A marker left by an earlier
-// attempt is kept: it holds the time from before that attempt, which is
-// returned instead.
+// BeginHydration prepares the placeholder f for content being written
+// into it, and returns its modification time from before. The time is kept
+// in XattrHydrating, together with whether we set fsNoatimeFl, so that
+// Discard or Finish can restore both. A marker left by an earlier attempt
+// is kept: it holds the state from before that attempt.
 func BeginHydration(f *os.File) (mtime time.Time, err error) {
 	fd := int(f.Fd())
-	var b [8]byte
-	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil && n == len(b) {
-		return time.Unix(0, int64(binary.LittleEndian.Uint64(b[:]))), nil
+	var b [9]byte
+	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil && n >= 8 {
+		return time.Unix(0, int64(binary.LittleEndian.Uint64(b[:8]))), nil
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return time.Time{}, err
 	}
-	binary.LittleEndian.PutUint64(b[:], uint64(st.Mtim.Nano()))
+	binary.LittleEndian.PutUint64(b[:8], uint64(st.Mtim.Nano()))
+	flags, err := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
+	if err == nil && flags&fsNoatimeFl == 0 {
+		b[8] = 1
+	}
+	// The marker first: if we crash after setting the flag, it says to
+	// clear it again.
 	if err := unix.Fsetxattr(fd, XattrHydrating, b[:], 0); err != nil {
 		return time.Time{}, err
 	}
+	if b[8] == 1 && unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, flags|fsNoatimeFl) != nil {
+		// Only the guard's view of a crash mid-hydration depends on it.
+		b[8] = 0
+		if err := unix.Fsetxattr(fd, XattrHydrating, b[:], 0); err != nil {
+			return time.Time{}, err
+		}
+	}
 	return time.Unix(st.Mtim.Unix()), nil
+}
+
+// endHydration clears fsNoatimeFl if BeginHydration set it.
+func endHydration(fd int, marker []byte) error {
+	if len(marker) < 9 || marker[8] != 1 {
+		return nil
+	}
+	flags, err := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
+	if err != nil {
+		return err
+	}
+	return unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, flags&^fsNoatimeFl)
 }
 
 // Interrupted reports whether the placeholder at path holds content from a
@@ -851,14 +883,14 @@ func Interrupted(path string) bool {
 // Nobody else may be hydrating f.
 func Discard(f *os.File) error {
 	fd := int(f.Fd())
-	var b [8]byte
+	var b [9]byte
 	n, err := unix.Fgetxattr(fd, XattrHydrating, b[:])
 	if errors.Is(err, unix.ENODATA) {
 		return nil // nothing was written
 	} else if err != nil {
 		return err
 	}
-	if n != len(b) {
+	if n < 8 {
 		return fmt.Errorf("corrupt %s", XattrHydrating)
 	}
 	var st unix.Stat_t
@@ -871,8 +903,11 @@ func Discard(f *os.File) error {
 	if err := unix.Ftruncate(fd, st.Size); err != nil {
 		return err
 	}
-	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(int64(binary.LittleEndian.Uint64(b[:])))}
+	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(int64(binary.LittleEndian.Uint64(b[:8])))}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
+		return err
+	}
+	if err := endHydration(fd, b[:n]); err != nil {
 		return err
 	}
 	return unix.Fremovexattr(fd, XattrHydrating)
@@ -914,6 +949,12 @@ func Finish(f *os.File, mtime, atime time.Time) error {
 	ts := []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
 		return err
+	}
+	var b [9]byte
+	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil {
+		if err := endHydration(fd, b[:n]); err != nil {
+			return err
+		}
 	}
 	// The hydration marker goes last: until the state is gone, it tells
 	// the scanner that the modification time is not to be trusted.

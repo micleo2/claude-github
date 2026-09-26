@@ -121,10 +121,28 @@ the service, and a reboot.
 
 **tether also implements C** (the placeholder guard, `lib/hsm/bpf/guard.bpf.c`):
 
-- **What it checks:** a sleepable `lsm.s/file_open` program. An open fails with `EIO` when the inode's fsnotify mask
-  lacks `FS_OPEN_PERM` (no group has it marked) **and** the file carries `user.tether.state=virtual`.
+- **What it checks:** a sleepable `lsm.s/file_open` program. An open fails with `EIO` when no live group has the inode
+  marked for `FS_OPEN_PERM` **and** the file carries `user.tether.state=virtual`.
+  - **"Live" matters.** When a group closes, the kernel flags it `shutdown` and then detaches its marks one by one.
+    Until an inode's mark is gone, its `i_fsnotify_mask` still says "marked", but the dying group raises no events.
+  - **Measured on the V8 client** (16,678 placeholders, `kill -9` of the service, one reader looping over 51
+    placeholders): the first guard trusted the mask, and 161 opens read zeros for up to 11 ms.
+  - **The fix:** the guard now walks the inode's marks with probe reads and accepts only a mark whose group is not
+    shutting down. The same measurement gives 1 zero read, three times out of three: the open that was already under
+    way.
+  - **What remains** (`TestGuardDuringTeardown`, 20,000 placeholders, 8 reader threads): at most one open per thread
+    that passed the guard just before the shutdown. The guard runs in `security_file_open`, a few instructions before
+    `fsnotify_open_perm`, which then finds the group gone. The old guard let about 7,500 through.
+  - **Reads already waiting** when the group dies are released by the kernel (`fanotify_release` answers them with
+    `FAN_ALLOW`) and read whatever the placeholder holds.
+
+  Both remaining cases need the monitor itself to die, since a crash of the sync process keeps the group. Both need
+  the kernel's help to close; see D.
 - **Cost for other files:** marked inodes and files with data blocks return before the xattr lookup. 200,000 opens
   of a small file changed by ±50 ns per open, which is within noise.
+  - **The exception:** a file being hydrated carries `chattr +A` (`S_NOATIME`) until the hydration finishes or is
+    discarded. The guard reads the xattr of such files even though they have data blocks, so a placeholder that a
+    crash left partly written is still refused ([stale-placeholders.md](stale-placeholders.md) §5).
 - **Buffer:** the xattr value goes into task-local storage. Dynptrs can't point at the stack, and a per-CPU buffer
   could be overwritten while the sleepable program sleeps.
 - **Installation:**
@@ -136,7 +154,7 @@ the service, and a reboot.
 - **Timing:** it takes effect about 1 ms after the group closes (marks are torn down asynchronously), and detaches
   about 10 ms after its pin is removed.
 - **Results:**
-  - `TestGuard` passes on ext4 and btrfs.
+  - `TestGuard` passes on ext4, btrfs and xfs.
   - On the V8 client, with `systemctl --user stop`, a shell whose working directory was inside the view got `EIO`
     instead of zeros, as did reads through the data directory. After a start, the same files downloaded and matched
     the hub.

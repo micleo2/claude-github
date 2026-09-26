@@ -12,6 +12,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -553,12 +554,34 @@ func TestGuard(t *testing.T) {
 	placeholder(t, l, lower, "later", int64(len(content)))
 	placeholder(t, nil, lower, "unmarked", 10)
 	os.WriteFile(filepath.Join(lower, "plain"), []byte("plain"), 0o644)
+	// What a crash mid-hydration leaves: an unmarked placeholder with some
+	// of its data, more than the guard's "holds data" threshold.
+	// (Built as an ordinary file, then labelled by path: the guard refuses
+	// to open it once it is a placeholder.)
+	partial := filepath.Join(lower, "partial")
+	if pf, err := os.Create(partial); err != nil {
+		t.Fatal(err)
+	} else {
+		pf.Truncate(1 << 20)
+		if _, err := BeginHydration(pf); err != nil {
+			t.Fatal(err)
+		}
+		pf.WriteAt(bytes.Repeat([]byte("p"), 256<<10), 0)
+		pf.Sync()
+		pf.Close()
+	}
+	if err := unix.Lsetxattr(partial, XattrState, []byte(StateVirtual), 0); err != nil {
+		t.Fatal(err)
+	}
 
 	if got, err := os.ReadFile(filepath.Join(view, "marked")); err != nil || !bytes.Equal(got, content) {
 		t.Fatalf("marked placeholder: %q, %v", got, err)
 	}
 	if _, err := os.ReadFile(filepath.Join(lower, "unmarked")); !errors.Is(err, unix.EIO) {
 		t.Fatalf("unmarked placeholder: %v, want EIO", err)
+	}
+	if _, err := os.ReadFile(filepath.Join(lower, "partial")); !errors.Is(err, unix.EIO) {
+		t.Fatalf("partly hydrated placeholder: %v, want EIO", err)
 	}
 	if got, err := os.ReadFile(filepath.Join(lower, "plain")); err != nil || string(got) != "plain" {
 		t.Fatalf("ordinary file: %q, %v", got, err)
@@ -631,6 +654,9 @@ func TestDiscardAndRetarget(t *testing.T) {
 		if !IsVirtual(f) {
 			t.Fatalf("%s: no longer a placeholder", what)
 		}
+		if flags, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS); err == nil && flags&fsNoatimeFl != 0 {
+			t.Fatalf("%s: noatime flag left set", what)
+		}
 	}
 	check("placeholder", 1<<20, t0)
 
@@ -645,6 +671,9 @@ func TestDiscardAndRetarget(t *testing.T) {
 		}
 		if !Interrupted(path) {
 			t.Fatal("no hydration marker")
+		}
+		if flags, err := unix.IoctlGetInt(int(f.Fd()), unix.FS_IOC_GETFLAGS); err == nil && flags&fsNoatimeFl == 0 {
+			t.Fatal("noatime flag not set while hydrating")
 		}
 	}
 	if err := Discard(f); err != nil {
@@ -741,4 +770,55 @@ func TestEvictRacingOpen(t *testing.T) {
 	if h.calls.Load() != 1 {
 		t.Fatalf("handler called %d times, want 1", h.calls.Load())
 	}
+}
+
+// When the group closes, the kernel detaches its marks one by one; until
+// an inode's mark is gone, its mask still says it is served. The guard must
+// not let placeholders through meanwhile: nothing would hydrate them.
+func TestGuardDuringTeardown(t *testing.T) {
+	h := &mapHandler{data: map[string][]byte{}} // hydration always fails
+	lower, _, l := setup(t, h, nil)
+	dir := filepath.Join(t.TempDir(), "guard")
+	if err := InstallGuard(dir); err != nil {
+		t.Skip(err)
+	}
+	defer unix.Unmount(dir, unix.MNT_DETACH)
+	defer RemoveGuard(dir)
+
+	const n = 20000
+	for i := range n {
+		placeholder(t, l, lower, fmt.Sprintf("p%05d", i), 4096)
+	}
+	var stop atomic.Bool
+	var opened, attempts atomic.Int64
+	var wg sync.WaitGroup
+	for w := range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := w; !stop.Load(); i = (i + 8) % n {
+				f, err := os.Open(filepath.Join(lower, fmt.Sprintf("p%05d", i)))
+				attempts.Add(1)
+				if err == nil {
+					opened.Add(1)
+					f.Close()
+				}
+			}
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	l.Close()
+	time.Sleep(200 * time.Millisecond)
+	stop.Store(true)
+	wg.Wait()
+	// An open that passed the guard just before the group shut down still
+	// gets through: the guard runs a few instructions before the fanotify
+	// hook, which then finds the group gone. Only the kernel can close
+	// that (see docs/research/daemon-restart.md). The guard used to let
+	// every open through until the inode's mark was detached: about 7,500
+	// of them here.
+	if opened.Load() > 100 {
+		t.Fatalf("%d of %d opens of placeholders succeeded around teardown", opened.Load(), attempts.Load())
+	}
+	t.Logf("%d of %d opens succeeded around teardown", opened.Load(), attempts.Load())
 }
