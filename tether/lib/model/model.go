@@ -1902,6 +1902,7 @@ func (m *model) Closed(conn protocol.Connection, err error) {
 	}
 	if len(remainingConns) == 0 {
 		// All device connections closed
+		m.od.noteDisconnect(deviceID)
 		delete(m.deviceConnIDs, deviceID)
 		delete(m.promotedConnID, deviceID)
 		delete(m.connRequestLimiters, deviceID)

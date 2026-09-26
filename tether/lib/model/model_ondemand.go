@@ -17,11 +17,13 @@ import (
 	"strings"
 	"sync"
 	"syscall"
+	"time"
 
 	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/config"
 	"github.com/syncthing/syncthing/lib/hsm"
 	"github.com/syncthing/syncthing/lib/locations"
+	"github.com/syncthing/syncthing/lib/protocol"
 )
 
 // ViewsFileName lists the on-demand views currently mounted, one per line.
@@ -49,11 +51,35 @@ type OnDemander interface {
 
 var _ OnDemander = (*model)(nil)
 
+// A device that just lost its connection is likely to be back shortly (a
+// connection being replaced, a brief network blip); hydrations wait for it
+// this long instead of failing at once.
+const reconnectGrace = 10 * time.Second
+
 type modelOnDemand struct {
 	mut    sync.Mutex
 	l      *hsm.Listener
 	cancel context.CancelFunc
 	views  map[string]string // folder ID -> view path
+
+	discMut     sync.Mutex
+	disconnects map[protocol.DeviceID]time.Time
+}
+
+func (o *modelOnDemand) noteDisconnect(dev protocol.DeviceID) {
+	o.discMut.Lock()
+	defer o.discMut.Unlock()
+	if o.disconnects == nil {
+		o.disconnects = make(map[protocol.DeviceID]time.Time)
+	}
+	o.disconnects[dev] = time.Now()
+}
+
+func (o *modelOnDemand) recentlyDisconnected(dev protocol.DeviceID) bool {
+	o.discMut.Lock()
+	defer o.discMut.Unlock()
+	t, ok := o.disconnects[dev]
+	return ok && time.Since(t) < reconnectGrace
 }
 
 type hsmHandler struct{ m *model }
@@ -179,6 +205,11 @@ func (m *model) sourceConnecting(folder string, names ...string) bool {
 			}
 		}
 		m.mut.RUnlock()
+		for _, dev := range devs {
+			if devCfg, ok := m.cfg.Device(dev); ok && !devCfg.Paused && m.od.recentlyDisconnected(dev) {
+				return true
+			}
+		}
 	}
 	return false
 }

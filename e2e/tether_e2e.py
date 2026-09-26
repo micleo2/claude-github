@@ -569,6 +569,191 @@ def indexer_denied(c):
 
 
 @test
+def mmap_odirect_pread(c):
+    """mmap, O_DIRECT and a mid-file pread on placeholders all see the real content."""
+    rnd = random.Random(20)
+    for mode in ("mmap", "odirect", "pread"):
+        rel = f"access/{mode}.bin"
+        FILES[rel] = rnd.randbytes(3 * MiB + 17)
+        c.write_server(rel, FILES[rel])
+        c.wait_placeholder(c.c2, rel)
+        if mode == "pread":
+            out = c.c2.sh(f"/opt/tether/probe pread '{VIEW}/{rel}' 2000000 5000").stdout.strip()
+            assert out == sha(FILES[rel][2000000:2005000]), mode
+        else:
+            out = c.c2.sh(f"/opt/tether/probe {mode} '{VIEW}/{rel}'").stdout.strip()
+            assert out == sha(FILES[rel]), mode
+        assert not c.c2.is_placeholder(rel), mode
+
+
+@test
+def truncating_overwrite(c):
+    """`echo new > placeholder` (O_TRUNC) ends with exactly the new content everywhere."""
+    rel = "overwrite.txt"
+    c.write_server(rel, b"old content that is longer\n")
+    c.wait_placeholder(c.c1, rel)
+    c.c1.sh(f"echo new > '{VIEW}/{rel}'")
+    FILES[rel] = b"new\n"
+    wait_for(lambda: open(c.server.lower(rel), "rb").read() == FILES[rel], what="server has new content")
+    wait_for(lambda: c.c2.view_sha(rel) == sha(FILES[rel]), what="c2 sees new content")
+
+
+@test
+def atomic_save_over_placeholder(c):
+    """Editors write a temp file and rename it over the original; the result syncs without conflicts."""
+    rel = "atomic.txt"
+    c.write_server(rel, b"draft 1\n")
+    c.wait_placeholder(c.c1, rel)
+    c.c1.sh(f"printf 'draft 2\\n' > '{VIEW}/.atomic.tmp' && mv '{VIEW}/.atomic.tmp' '{VIEW}/{rel}'")
+    FILES[rel] = b"draft 2\n"
+    wait_for(lambda: open(c.server.lower(rel), "rb").read() == FILES[rel], what="server has draft 2")
+    assert not [n for n in os.listdir(c.server.lower()) if "sync-conflict" in n and "atomic" in n]
+
+
+@test
+def directory_rename_with_placeholders(c):
+    """Renaming a directory full of placeholders moves them all, with no data transfer and no loss."""
+    rnd = random.Random(21)
+    names = [f"proj/src/f{i}.bin" for i in range(20)]
+    for rel in names:
+        FILES[rel] = rnd.randbytes(64 * 1024 + i if (i := rnd.randrange(1000)) else 1)
+        c.write_server(rel, FILES[rel])
+    for rel in names:
+        c.wait_placeholder(c.c1, rel)
+    c.c1.sh(f"mv '{VIEW}/proj' '{VIEW}/project'")
+    moved = [r.replace("proj/", "project/", 1) for r in names]
+    for rel in moved:
+        assert c.c1.is_placeholder(rel), rel
+
+    def server_moved():
+        return not os.path.exists(c.server.lower("proj")) and all(
+            os.path.exists(c.server.lower(r)) for r in moved)
+    wait_for(server_moved, 90, what="server moved the directory")
+    for old, rel in zip(names, moved):
+        with open(c.server.lower(rel), "rb") as f:
+            assert sha(f.read()) == sha(FILES[old]), rel
+        FILES[rel] = FILES.pop(old)
+    assert c.c1.view_sha(moved[3]) == sha(FILES[moved[3]])
+
+
+@test
+def listing_does_not_hydrate(c):
+    """ls -lR / find / stat over many placeholders never downloads content."""
+    rnd = random.Random(22)
+    root = c.server.lower("many")
+    for d in range(30):
+        os.makedirs(os.path.join(root, f"d{d:02}"), exist_ok=True)
+        for i in range(50):
+            with open(os.path.join(root, f"d{d:02}", f"f{i:02}.txt"), "wb") as f:
+                f.write(rnd.randbytes(100 + i))
+    t0 = time.time()
+    c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub=many")
+    wait_for(lambda: c.c2.api("GET", f"/rest/db/status?folder={FOLDER}")["needFiles"] == 0 and
+             os.path.exists(c.c2.lower("many/d29/f49.txt")), 120, what="1500 placeholders on c2")
+    print(f"      1500 placeholders on c2 after {time.time() - t0:.1f}s")
+    out = c.c2.sh(f"ls -lR '{VIEW}/many' | grep -c '\\.txt$'; find '{VIEW}/many' -type f | wc -l; "
+                  f"du -s --apparent-size '{VIEW}/many'").stdout.split()
+    assert out[0] == "1500" and out[1] == "1500", out
+    hydrated = [f for f, st in c.c2.status("many").items() if st["state"] != "online-only"]
+    assert not hydrated, hydrated[:5]
+    # grep -r reads everything and must see real content
+    p = c.c2.sh(f"grep -rl --binary-files=text . '{VIEW}/many' | wc -l")
+    assert p.stdout.strip() == "1500", p.stdout
+
+
+@test
+def large_file(c):
+    rel = "large.bin"
+    FILES[rel] = os.urandom(256 * MiB)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(c.c1, rel, timeout=120)
+    t0 = time.time()
+    assert c.c1.view_sha(rel) == sha(FILES[rel])
+    dt = time.time() - t0
+    print(f"      256 MiB hydrated in {dt:.1f}s ({256 / dt:.0f} MiB/s)")
+
+
+@test
+def client_restart_keeps_state(c):
+    n = c.c2
+    before = n.status()
+    run("docker", "restart", n.container)
+    wait_for(lambda: n.api("GET", "/rest/system/status"), 60, what="restart")
+    wait_for(lambda: n.sh(f"grep -q ' {VIEW} ' /proc/self/mountinfo", check=False).returncode == 0, 30,
+             what="view remounted")
+    after = n.status()
+    assert {k: v["state"] for k, v in before.items()} == {k: v["state"] for k, v in after.items()}
+    rel = next(k for k, v in after.items() if v["state"] == "online-only" and k in FILES and FILES[k])
+    assert n.view_sha(rel) == sha(FILES[rel])
+
+
+@test
+def offline_conflicting_edits(c):
+    """Both sides edit the same (hydrated) file while apart: both versions survive."""
+    rel = "conflict.txt"
+    c.write_server(rel, b"base\n")
+    c.wait_placeholder(c.c1, rel)
+    assert c.c1.view_sha(rel) == sha(b"base\n")
+    c.c1.pause(c.server)
+    try:
+        c.c1.sh(f"echo client-edit > '{VIEW}/{rel}'")
+        time.sleep(1.5)
+        with open(c.server.lower(rel), "wb") as f:
+            f.write(b"server-edit\n")
+        c.server.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={rel}")
+        wait_for(lambda: c.c1.db_file(rel)["local"]["size"] == len(b"client-edit\n"), what="c1 scanned edit")
+    finally:
+        c.c1.resume(c.server)
+
+    def both_survive():
+        contents = set()
+        for name in os.listdir(c.server.lower()):
+            if name == rel or (name.startswith("conflict.sync-conflict-") and name.endswith(".txt")):
+                with open(c.server.lower(name), "rb") as f:
+                    contents.add(f.read())
+        return {b"client-edit\n", b"server-edit\n"} <= contents
+    wait_for(both_survive, 90, what="both versions on the server")
+
+
+@test
+def placeholder_metadata_vs_remote_content_conflict(c):
+    """c1 chmods a placeholder while offline, the server rewrites the content: the cluster converges, nothing is lost."""
+    rel = "meta-conflict.bin"
+    orig = random.Random(24).randbytes(1 * MiB)
+    c.write_server(rel, orig)
+    c.wait_placeholder(c.c1, rel)
+    c.c1.pause(c.server)
+    try:
+        c.c1.sh(f"chmod 600 '{VIEW}/{rel}'")
+        wait_for(lambda: c.c1.db_file(rel)["local"]["permissions"] == "0600", what="c1 scanned chmod")
+        assert c.c1.is_placeholder(rel)
+        time.sleep(1.5)
+        FILES[rel] = random.Random(25).randbytes(1 * MiB)
+        c.write_server(rel, FILES[rel])
+    finally:
+        c.c1.resume(c.server)
+
+    def converged():
+        s = c.server.api("GET", f"/rest/db/status?folder={FOLDER}")
+        k = c.c1.api("GET", f"/rest/db/status?folder={FOLDER}")
+        return (s["needFiles"] == 0 and k["needFiles"] == 0 and c.synced(c.c1, rel) and c.synced(c.server, rel)
+                and c.c1.db_file(rel)["global"]["version"] == c.server.db_file(rel)["global"]["version"])
+    wait_for(converged, 90, what="cluster converged")
+    # The server's new content must exist somewhere on the server, and the
+    # file c1 sees must be readable and match what the server holds.
+    server_versions = set()
+    for name in os.listdir(c.server.lower()):
+        if name.startswith("meta-conflict"):
+            with open(c.server.lower(name), "rb") as f:
+                server_versions.add(sha(f.read()))
+    assert sha(FILES[rel]) in server_versions, "server's new content was lost"
+    with open(c.server.lower(rel), "rb") as f:
+        FILES[rel] = f.read()
+    assert c.c1.view_sha(rel) == sha(FILES[rel])
+
+
+
+@test
 def cache_budget_evicts_lru(c):
     n = c.c2
     names = [f"budget/{i}.bin" for i in range(3)]
@@ -662,7 +847,7 @@ def main():
     passed, failed = [], []
     try:
         for t in TESTS:
-            if args.k and args.k not in t.__name__:
+            if args.k and not any(k in t.__name__ for k in args.k.split(",")):
                 continue
             start = time.time()
             try:
