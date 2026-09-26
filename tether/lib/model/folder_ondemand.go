@@ -78,6 +78,14 @@ type onDemandState struct {
 	// flushPuller asks the puller to commit its batch now.
 	flushPuller chan struct{}
 
+	// Hydrated files whose content is complete but not yet durable, by
+	// inode. They stay placeholders until a background fsync (see
+	// finishLater); accesses to them go ahead meanwhile.
+	completeMut sync.Mutex
+	complete    map[[2]uint64]struct{}
+	finishing   sync.WaitGroup
+	finishSem   chan struct{}
+
 	// One hydration per file at a time; later callers wait for it.
 	flightMut sync.Mutex
 	flights   map[string]*hydrationFlight
@@ -85,7 +93,7 @@ type onDemandState struct {
 	pf prefetchQueue
 
 	mut       sync.Mutex
-	hydrating map[string]struct{}
+	hydrating map[string]int
 	pinKey    string
 	pins      *ignore.Matcher
 	viewErr   error
@@ -93,11 +101,13 @@ type onDemandState struct {
 
 func newOnDemandState() *onDemandState {
 	return &onDemandState{
-		hydrating:   make(map[string]struct{}),
+		hydrating:   make(map[string]int),
 		started:     time.Now(),
 		hydrated:    make(map[string][]byte),
 		hydratedC:   make(chan struct{}, 1),
 		flushPuller: make(chan struct{}, 1),
+		complete:    make(map[[2]uint64]struct{}),
+		finishSem:   make(chan struct{}, maxFinishing),
 		flights:     make(map[string]*hydrationFlight),
 		pf:          newPrefetchQueue(),
 	}
@@ -156,8 +166,8 @@ func (f *sendReceiveFolder) setHydrating(name string, on bool) {
 	f.od.mut.Lock()
 	defer f.od.mut.Unlock()
 	if on {
-		f.od.hydrating[name] = struct{}{}
-	} else {
+		f.od.hydrating[name]++
+	} else if f.od.hydrating[name]--; f.od.hydrating[name] <= 0 {
 		delete(f.od.hydrating, name)
 	}
 }
@@ -280,15 +290,14 @@ func (c placeholderChecker) Placeholder(name string) (scanner.Placeholder, bool)
 	// Keep hydrations of this file out while we look at it: the
 	// modification time is not the file's while content is being written.
 	f.od.flightMut.Lock()
-	_, busy := f.od.flights[name]
-	if !busy {
-		f.od.flights[name] = &hydrationFlight{done: make(chan struct{})}
-	}
-	f.od.flightMut.Unlock()
-	if busy || f.isHydrating(name) {
-		// Content is being written right now; leave it alone.
+	if _, busy := f.od.flights[name]; busy || f.isHydrating(name) {
+		f.od.flightMut.Unlock()
+		// Content is being written or made durable right now; leave it
+		// alone.
 		return scanner.Placeholder{}, true
 	}
+	f.od.flights[name] = &hydrationFlight{done: make(chan struct{})}
+	f.od.flightMut.Unlock()
 	defer func() {
 		f.od.flightMut.Lock()
 		fl := f.od.flights[name]
@@ -300,7 +309,12 @@ func (c placeholderChecker) Placeholder(name string) (scanner.Placeholder, bool)
 	if hsm.Interrupted(path) {
 		// A hydration failed without cleaning up, or we crashed during
 		// one.
-		if err := f.discardPartial(name); err != nil {
+		if err := f.discardPartial(name); errors.Is(err, hsm.ErrModified) {
+			// Written to after its download completed; an ordinary
+			// file now, which the scanner treats as changed.
+			f.sl.Info("Kept a file written to during its download", slogutil.FilePath(name))
+			return scanner.Placeholder{}, false
+		} else if err != nil {
 			f.sl.Warn("Failed to reset interrupted hydration", slogutil.FilePath(name), slogutil.Error(err))
 			return scanner.Placeholder{}, true
 		}
@@ -389,6 +403,10 @@ type hydrationFlight struct {
 // hydrations of the same name share one download.
 func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.File, kind hydrateKind) error {
 	for attempt := 0; attempt < 3; attempt++ {
+		if f.isComplete(dst) {
+			f.sl.Debug("Content complete, being made durable", slogutil.FilePath(name), "kind", kind)
+			return nil
+		}
 		if _, _, ok := hsm.ReadPlaceholderFile(dst); !ok {
 			return nil // already hydrated
 		}
@@ -466,17 +484,13 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 				f.sl.Debug("Hydrating newer version of superseded placeholder", slogutil.FilePath(name))
 				src, bh = newer, blocksHashOf(newer)
 			}
-			err = f.hydrateContent(ctx, name, src, dst, kind)
+			recordIt := func() {}
+			if record {
+				bh := bh
+				recordIt = func() { f.recordHydrated(name, bh) }
+			}
+			err = f.hydrateContent(ctx, name, src, dst, kind, recordIt)
 			if err == nil {
-				if record {
-					f.od.hydratedMut.Lock()
-					f.od.hydrated[name] = bh
-					f.od.hydratedMut.Unlock()
-					select {
-					case f.od.hydratedC <- struct{}{}:
-					default:
-					}
-				}
 				return nil
 			}
 		}
@@ -583,7 +597,7 @@ func (f *sendReceiveFolder) latestGlobal(name string) (protocol.FileInfo, bool) 
 
 // hydrateContent writes the content of src into the placeholder dst and
 // turns it into a normal file.
-func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src protocol.FileInfo, dst *os.File, kind hydrateKind) error {
+func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src protocol.FileInfo, dst *os.File, kind hydrateKind, record func()) error {
 	st, err := dst.Stat()
 	if err != nil {
 		return err
@@ -595,7 +609,12 @@ func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src
 	// The modification time from before any content was written, also by
 	// an earlier attempt that was interrupted.
 	mtime, err := hsm.BeginHydration(dst)
-	if err != nil {
+	if errors.Is(err, hsm.ErrModified) {
+		// An earlier attempt completed and an application wrote to the
+		// file since; the scanner picks the change up.
+		f.sl.Info("Kept a file written to during its download", slogutil.FilePath(name))
+		return nil
+	} else if err != nil {
 		return err
 	}
 	if err := f.fetchBlocks(ctx, name, src, dst); err != nil {
@@ -607,10 +626,6 @@ func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src
 		}
 		return err
 	}
-	// The content must be durable before the index says it is local.
-	if err := dst.Sync(); err != nil {
-		return err
-	}
 	// Prefetched files get an access time older than their mtime: the cache
 	// budget evicts them first if nobody uses them, and the first real read
 	// refreshes it (relatime updates an atime older than mtime).
@@ -618,19 +633,138 @@ func (f *sendReceiveFolder) hydrateContent(ctx context.Context, name string, src
 	if kind == hydratePrefetch {
 		atime = time.Unix(1, 0)
 	}
-	if err := hsm.Finish(dst, mtime, atime); err != nil {
+	// What the application may stat meanwhile. From here on, a write by
+	// an application is recognised (hsm.Complete).
+	if err := hsm.SetTimes(dst, mtime, atime); err != nil {
 		return err
 	}
-	f.model.hsmUnmark(dst)
-
-	// The file is complete and durable, so the application can go on. The
-	// index update is batched by the caller: doing it inline costs a
-	// database transaction and event bus round trips per file, which
-	// dominated the latency of opening many small files. If we crash before
-	// the batch is committed, the scanner notices that the file is no
-	// longer a placeholder and fixes the index (see walker.walkRegular).
+	if err := hsm.Complete(dst); err != nil {
+		return err
+	}
+	// The content must be durable before the file stops being a
+	// placeholder, and before the index says it is local: otherwise a
+	// power loss could leave a file that looks local but holds zeros.
+	finish := func(fd *os.File) error {
+		if err := fd.Sync(); err != nil {
+			return err
+		}
+		if err := hsm.Finish(fd, mtime, atime); err != nil {
+			return err
+		}
+		f.model.hsmUnmark(fd)
+		return nil
+	}
 	f.sl.Debug("Hydrated file", slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
+	// Explicit requests (pins, `tether hydrate`) promise a local file when
+	// they return; the others go on at once.
+	if kind != hydrateExplicit && f.finishLater(name, dst, finish, record) {
+		return nil
+	}
+	if err := finish(dst); err != nil {
+		return err
+	}
+	record()
 	return nil
+}
+
+// finishDelay holds hydrated files in the durability window for longer.
+// Tests stretch it (TETHER_FINISH_DELAY) to exercise that window.
+var finishDelay = func() time.Duration {
+	d, _ := time.ParseDuration(os.Getenv("TETHER_FINISH_DELAY"))
+	return d
+}()
+
+// maxFinishing bounds the hydrated files waiting to be made durable in the
+// background; beyond it, hydration waits for its own fsync.
+const maxFinishing = 256
+
+// finishLater lets the application go on as soon as the content is
+// complete, and makes the file durable in the background: an fsync costs
+// several milliseconds per file (9 ms on btrfs), more than fetching a small
+// file over a LAN. Until then the file stays a marked placeholder, with
+// its hydration marker, that accesses go through unhindered (see
+// isComplete); a crash meanwhile leaves an interrupted hydration, which is
+// discarded as usual. record is called once the file is durable.
+func (f *sendReceiveFolder) finishLater(name string, dst *os.File, finish func(*os.File) error, record func()) bool {
+	key, ok := hsm.Key(dst)
+	if !ok {
+		return false
+	}
+	select {
+	case f.od.finishSem <- struct{}{}:
+	default:
+		return false
+	}
+	dup, err := hsm.Dup(dst)
+	if err != nil {
+		<-f.od.finishSem
+		return false
+	}
+	f.setComplete(key, true)
+	// Keeps the scanner away until the file is durable.
+	f.setHydrating(name, true)
+	f.od.finishing.Add(1)
+	go func() {
+		defer f.od.finishing.Done()
+		defer func() { <-f.od.finishSem }()
+		defer dup.Close()
+		defer f.setHydrating(name, false)
+		defer f.setComplete(key, false)
+		if finishDelay > 0 {
+			time.Sleep(finishDelay)
+		}
+		if err := finish(dup); err != nil {
+			// The content is not durable: back to a plain placeholder.
+			f.sl.Warn("Failed to store a hydrated file; it stays online-only", slogutil.FilePath(name), slogutil.Error(err))
+			if err := hsm.Discard(dup); errors.Is(err, hsm.ErrModified) {
+				f.sl.Info("Kept a file written to during its download", slogutil.FilePath(name))
+			} else if err != nil {
+				f.sl.Warn("Failed to reset placeholder", slogutil.FilePath(name), slogutil.Error(err))
+			}
+			return
+		}
+		record()
+	}()
+	return true
+}
+
+func (f *sendReceiveFolder) setComplete(key [2]uint64, on bool) {
+	f.od.completeMut.Lock()
+	defer f.od.completeMut.Unlock()
+	if on {
+		f.od.complete[key] = struct{}{}
+	} else {
+		delete(f.od.complete, key)
+	}
+}
+
+// isComplete reports whether dst's content is complete and being made
+// durable in the background.
+func (f *sendReceiveFolder) isComplete(dst *os.File) bool {
+	key, ok := hsm.Key(dst)
+	if !ok {
+		return false
+	}
+	f.od.completeMut.Lock()
+	defer f.od.completeMut.Unlock()
+	_, ok = f.od.complete[key]
+	return ok
+}
+
+// recordHydrated queues the index update for a hydrated file. It is
+// batched: doing it inline costs a database transaction and event bus round
+// trips per file, which dominated the latency of opening many small files.
+// If we crash before the batch is committed, the scanner notices that the
+// file is no longer a placeholder and fixes the index (see
+// walker.walkRegular).
+func (f *sendReceiveFolder) recordHydrated(name string, bh []byte) {
+	f.od.hydratedMut.Lock()
+	f.od.hydrated[name] = bh
+	f.od.hydratedMut.Unlock()
+	select {
+	case f.od.hydratedC <- struct{}{}:
+	default:
+	}
 }
 
 // supersededBy returns the global version of name if it replaces the
@@ -669,6 +803,20 @@ func (f *sendReceiveFolder) isFileAt(name string, fd *os.File) bool {
 	return err == nil && os.SameFile(a, b)
 }
 
+// awaitFinishing waits, at most for timeout, for hydrated files still being
+// made durable. Those that are not by then remain interrupted hydrations.
+func (f *sendReceiveFolder) awaitFinishing(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() {
+		f.od.finishing.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+	}
+}
+
 // hydratedCommitDelay batches index updates for hydrated files. Tests can
 // stretch it (TETHER_HYDRATED_COMMIT_DELAY) to exercise crash recovery.
 var hydratedCommitDelay = func() time.Duration {
@@ -682,6 +830,7 @@ func (f *sendReceiveFolder) hydratedCommitter(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			f.awaitFinishing(5 * time.Second)
 			_ = f.commitHydrated()
 			return
 		case <-f.od.hydratedC:

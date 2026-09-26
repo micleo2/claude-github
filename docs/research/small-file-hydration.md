@@ -113,6 +113,74 @@ before their prefetch finishes.
   opened in a directory, or off `FAN_OPEN` on the directory itself. Whether that fires early enough for every tool is
   **unverified**.
 
+## 4. Durability off the critical path (September 2026)
+
+**Measured on the V8 deployment** (Arch client, btrfs `/home`, LAN round trip 0.4 ms): a cold single-file read took
+7–16 ms, and a cold `git status` 54.6 s.
+- **Why `git status` reads everything:** the stat data in `.git/index` never matches a file created on another
+  machine, so git re-hashes every file, and all 19,816 get hydrated.
+- **Where the time went:** tracing one hydration showed each `fsync` taking about 9 ms on btrfs (35 fsyncs, 0.31 s,
+  for one cold file and its prefetched siblings). Hydration fsynced every file before letting the application go on.
+
+**What others do** (survey; sources below):
+
+| Durability rule | Systems |
+|---|---|
+| Durable, *then* the "local" flag is published | Syncthing (fsync of the temp file before the rename), Lustre HSM (`llapi_hsm_action_end` fsyncs a restore), GitHub's libprojfs design ("fsync … before removing the empty-placeholder attribute") |
+| No fsync; repair after a crash | EdenFS (overlay fsck after an unclean shutdown), CernVM-FS (content-addressed cache, `cvmfs_fsck`), git's default `core.fsync` |
+| No fsync, no repair (a flag can outlive its data) | rclone VFS, SeaDrive, Nextcloud |
+| Batched durability | git `core.fsyncMethod=batch`, Syncthing's batched directory fsync |
+
+**tether now keeps the invariant but moves the fsync off the application's path:**
+- As soon as the content is written, the times are restored and the file is recorded as complete (`hsm.Complete`,
+  a flag in the hydration marker). The application goes on.
+- A bounded pool (256) makes each file durable in the background, and only then removes the placeholder state and
+  the mark (`finishLater`). Until then the file is still a marked placeholder that accesses pass through at once, and
+  the scanner leaves it alone.
+- **After a crash or power loss,** a file that was not durable yet is an interrupted hydration. It is discarded and
+  downloaded again, so it never becomes a local file full of zeros.
+- **Explicit hydrations** (pins, `tether hydrate`) still finish before they return.
+
+**The hazard the survey warned about: an application writing inside that window.** The kernel raises the same
+pre-content event for reads and writes, so tether cannot tell them apart. The mtime tells it instead: `Complete`
+follows restoring the recorded mtime, and any later write changes it.
+- `Finish` then leaves the times alone.
+- Crash recovery (`Discard`) and a new hydration attempt keep the file as a local change (`ErrModified`) rather than
+  discarding it. The scanner then uploads it.
+- Tests: `TestWriteAfterComplete`, and e2e `write_while_being_made_durable`, which appends right after the download
+  and checks that the server gets the change.
+
+**Bugs the window exposed, found by the V8 stress runs:**
+1. **The listener unmarked a file as soon as its handler returned.** A second open inside the window then found an
+   unmarked placeholder, and the guard refused it with EIO (17 of 30 evict-then-read cycles failed). The mark now stays
+   until the file is durable. Test: e2e `reread_right_after_hydration`, with `TETHER_FINISH_DELAY` holding the window
+   open.
+2. **The listener's "did the handler finish" check read two xattrs in two calls.** It could see the state before
+   and the marker after the finisher removed them. It now reads them in the order they are removed.
+3. **The scanner's placeholder check leaked its hydration slot** when the file was "hydrating" but held no slot, which
+   the window made common. The next read of that file then waited forever. Test: e2e `scan_while_being_made_durable`,
+   which hangs on the old code.
+4. **Read-only files** (git objects, 0444): the background `Finish` runs after the file's mode is restored, and
+   removing a `user.*` xattr needs write permission. xattr updates now add the owner's write bit for a moment on
+   `EACCES`. Test: `TestOpenForWriteReadOnlyFile`, run as `nobody`.
+5. **A race introduced by marking before evicting** (`stale-placeholders.md` §4): a reader opening the file between
+   the eviction's mark and the placeholder state made the listener remove the fresh mark. The listener now leaves
+   inodes being evicted alone.
+
+**Results on V8:**
+
+| | Before | After |
+|---|---|---|
+| Cold read of a 3.7 KB file | 7.5 ms | 1.7 ms |
+| Cold read of a 3.1 KB file (a new directory) | 14 ms | 4–7 ms |
+| `cat` of all 199 files of a cold `src/heap` | 197 ms | 88–91 ms |
+| Cold read of the whole tree, 19,816 files (`sha256sum -c`) | 55 s | **10–15 s**, 0 errors in 6 runs |
+| Cold `git status` | 54.6 s | **9.6–15 s** |
+| Warm `git status` | 0.5 s | 0.2–0.5 s |
+
+The remaining per-file cost is the fetch itself, and the first file of each directory still waits for a full round
+trip. Crawler-aware prefetch ([docs/design/crawler-prefetch.md](../design/crawler-prefetch.md)) is the next lever.
+
 ## Sources
 
 1. https://github.com/MicrosoftDocs/sdk-api/blob/docs/sdk-api-src/content/cfapi/ns-cfapi-cf_sync_policies.md
@@ -150,3 +218,12 @@ before their prefetch finishes.
 33. https://lwn.net/Articles/983376/
 34. https://www.phoronix.com/news/Linux-6.14-precontent-fanotify
 35. https://github.com/josefbacik/remote-fetch
+- EdenFS inode storage: https://github.com/facebook/sapling/blob/main/eden/fs/docs/InodeStorage.md
+- EdenFS `FsInodeCatalog.cpp`: https://github.com/facebook/sapling/blob/main/eden/fs/inodes/fscatalog/FsInodeCatalog.cpp
+- libprojfs design: https://github.com/github/libprojfs/blob/master/docs/design.md
+- Lustre `liblustreapi_hsm.c`: https://github.com/lustre/lustre-release/blob/master/lustre/utils/liblustreapi_hsm.c
+- git `core.fsync` and `core.fsyncMethod`: https://git-scm.com/docs/git-config
+- CernVM-FS POSIX cache: https://github.com/cvmfs/cvmfs/blob/devel/cvmfs/cache_posix.cc
+- rclone VFS cache item: https://github.com/rclone/rclone/blob/master/vfs/vfscache/item.go
+- SeaDrive file cache: https://github.com/haiwen/seadrive-fuse/blob/master/src/file-cache-mgr.c
+- Syncthing `disableFsync`: https://docs.syncthing.net/users/config.html

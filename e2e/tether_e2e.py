@@ -1172,6 +1172,100 @@ def interrupted_hydration_is_reset(c):
     assert n.view_sha(rel) == sha(FILES[rel])
 
 
+def restart_with(n, env=()):
+    n.start(env=list(env))
+    wait_for(lambda: n.sh(f"grep -q ' {VIEW} ' /proc/self/mountinfo", check=False).returncode == 0, 30,
+             what="view mounted")
+
+
+@test
+def reread_right_after_hydration(c):
+    """A file is read again at once after its download, while it is still being made durable: never an error or zeros."""
+    n = c.c1
+    restart_with(n, ["TETHER_FINISH_DELAY=300ms"])
+    try:
+        rel = "reread.bin"
+        FILES[rel] = random.Random(84).randbytes(3000)
+        c.write_server(rel, FILES[rel])
+        c.wait_placeholder(n, rel)
+        for i in range(10):
+            n.od("evict", rel, expect_error=True)
+            wait_for(lambda: n.is_placeholder(rel), 10, what="evicted")
+            p = n.sh(f"for i in 1 2 3; do sha256sum '{VIEW}/{rel}' '{LOWER}/{rel}'; done", check=False)
+            assert p.returncode == 0, (i, p.stderr)
+            assert set(l.split()[0] for l in p.stdout.splitlines()) == {sha(FILES[rel])}, (i, p.stdout)
+            wait_for(lambda: not n.db_file(rel)["local"]["localFlags"] & 128, 10, what="hydration recorded")
+    finally:
+        restart_with(n)
+
+
+@test
+def write_while_being_made_durable(c):
+    """An application writes to a file right after its download, before it is durable: the write is kept and synced."""
+    n = c.c1
+    restart_with(n, ["TETHER_FINISH_DELAY=2s"])
+    try:
+        rel = "durable-write.txt"
+        orig = b"downloaded content\n"
+        c.write_server(rel, orig)
+        c.wait_placeholder(n, rel)
+        n.sh(f"cat '{VIEW}/{rel}' > /dev/null && sleep 0.1 && echo appended >> '{VIEW}/{rel}'")
+        FILES[rel] = orig + b"appended\n"
+        time.sleep(3)  # past the durability window
+        assert not n.is_placeholder(rel)
+        with open(n.lower(rel), "rb") as f:
+            assert f.read() == FILES[rel]
+
+        def server_has():
+            with open(c.server.lower(rel), "rb") as f:
+                return f.read() == FILES[rel]
+        wait_for(server_has, 60, what="server got the write")
+    finally:
+        restart_with(n)
+
+
+@test
+def scan_while_being_made_durable(c):
+    """A scan while a downloaded file is being made durable leaves it alone, and it downloads again later."""
+    n = c.c1
+    restart_with(n, ["TETHER_FINISH_DELAY=2s"])
+    try:
+        rel = "durable-scan.bin"
+        FILES[rel] = random.Random(86).randbytes(100 * 1024)
+        c.write_server(rel, FILES[rel])
+        c.wait_placeholder(n, rel)
+        assert n.view_sha(rel) == sha(FILES[rel])
+        n.api("POST", f"/rest/db/scan?folder={FOLDER}&sub={urllib.request.quote(rel)}")
+        wait_for(lambda: not n.is_placeholder(rel) and not n.db_file(rel)["local"]["localFlags"] & 128, 15,
+                 what="durable and recorded")
+        n.od("evict", rel)
+        p = n.sh(f"timeout 10 sha256sum '{VIEW}/{rel}'", check=False)
+        assert p.returncode == 0 and p.stdout.split()[0] == sha(FILES[rel]), (p.returncode, p.stdout, p.stderr)
+    finally:
+        restart_with(n)
+
+
+@test
+def crash_while_being_made_durable(c):
+    """A crash after a download completes but before it is durable leaves a placeholder or the content, never zeros."""
+    n = c.c1
+    restart_with(n, ["TETHER_FINISH_DELAY=1h"])
+    rel = "durable-crash.bin"
+    FILES[rel] = random.Random(85).randbytes(200 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    version = n.db_file(rel)["local"]["version"]
+    assert n.view_sha(rel) == sha(FILES[rel])
+    assert n.is_placeholder(rel), "should still be in the durability window"
+    run("docker", "kill", n.container)
+    restart_with(n)
+    assert n.view_sha(rel) == sha(FILES[rel])
+    wait_for(lambda: not n.is_placeholder(rel) and not n.db_file(rel)["local"]["localFlags"] & 128, 30,
+             what="hydrated and recorded")
+    f = n.db_file(rel)
+    assert f["local"]["version"] == version and f["global"]["version"] == version, f
+
+
 @test
 def no_zero_uploads(c):
     """Global invariant: every file the server has matches what was written; nothing became zeros."""

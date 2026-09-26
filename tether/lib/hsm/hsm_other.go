@@ -77,3 +77,11 @@ func InstallGuard(string) error                         { return errUnsupported 
 func RemoveGuard(string) error                          { return nil }
 func OpenPathForWrite(string) (*os.File, func(), error) { return nil, nil, errUnsupported }
 func Unlease(*os.File) error                            { return errUnsupported }
+
+func Key(*os.File) ([2]uint64, bool)                { return [2]uint64{}, false }
+func Dup(*os.File) (*os.File, error)                { return nil, errUnsupported }
+func SetTimes(*os.File, time.Time, time.Time) error { return errUnsupported }
+
+var ErrModified = errors.New("written to after its download completed; kept as a local change")
+
+func Complete(*os.File) error { return errUnsupported }

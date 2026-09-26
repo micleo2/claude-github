@@ -123,7 +123,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 42 end-to-end tests, ~5 min
+sudo e2e/run.sh                          # 46 end-to-end tests, ~6 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -139,7 +139,7 @@ loop-mounted ext4 filesystem. The suite covers:
 - offline and silent network loss
 - peers never serving placeholders
 - indexer denial and the cache budget
-- `kill -9` recovery, interrupted hydrations and client restart
+- `kill -9` recovery, interrupted hydrations, the window while a download is made durable, and client restart
 - conflicts
 - the CLI
 - a final check that no file ever became zeros
@@ -177,6 +177,9 @@ host's network). Both fail identically on unmodified upstream in this environmen
   - btrfs: about 1.4 KB
 
   The kernel has no pre-content hook for `readdir`/`lookup` yet, so listings can't be populated lazily.
+- **Cold access costs one fetch per file.** On a LAN the V8 tree (19,816 files) reads cold in 10–15 s, and a cold
+  `git status` takes the same, since git re-hashes files whose stat data came from another machine. Downloads are made
+  durable in the background; see [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md) §4.
 - **Whole-file hydration.** Range hydration works at the kernel level (see the spike), but the daemon downloads whole
   files. Opening a large file waits for all of it.
 - **The first file opened in each directory still waits one full fetch.** Its siblings are prefetched, but tools that

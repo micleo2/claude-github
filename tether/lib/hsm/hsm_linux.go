@@ -76,8 +76,8 @@ const (
 // Handler supplies file content.
 type Handler interface {
 	// Hydrate writes the complete content of the placeholder at name
-	// (relative to the view's folder) into f, then calls Finish(f), and
-	// returns nil. Otherwise it returns an error whose errno (if any) is
+	// (relative to the view's folder) into f, then calls Finish(f), or
+	// Complete(f) and Finish later, and returns nil. Otherwise it returns an error whose errno (if any) is
 	// reported to the blocked application.
 	Hydrate(ctx context.Context, folder, name string, f *os.File) error
 }
@@ -111,6 +111,9 @@ type Listener struct {
 	views []*View
 
 	flights sync.Map // fileKey -> *flight
+	// Inodes being evicted (dev, ino): marked before they become
+	// placeholders, so the listener must not unmark them meanwhile.
+	evicting sync.Map
 
 	closeOnce sync.Once
 	// fdMu keeps responses from being written after Close: the fd number
@@ -467,6 +470,10 @@ func (l *Listener) Evict(folder, name string, size int64, origin string, blocksH
 	defer f.Close()
 	defer restore()
 	fd := int(f.Fd())
+	if key, ok := Key(f); ok {
+		l.evicting.Store(key, struct{}{})
+		defer l.evicting.Delete(key)
+	}
 	if err := l.markMask(fd, eventMask); err != nil {
 		return err
 	}
@@ -653,7 +660,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		return 0
 	}
 	if !IsVirtual(f) {
-		l.unmark(fd)
+		l.unmarkLocal(f)
 		return 0
 	}
 	var st unix.Stat_t
@@ -694,8 +701,24 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		}
 		return unix.EIO
 	}
-	l.unmark(fd)
+	// A file whose content is complete but not yet durable stays marked:
+	// unmarked, the guard would refuse it as the placeholder it still is.
+	// The handler unmarks it once it is done (Unmark).
+	if !IsVirtual(f) {
+		l.unmarkLocal(f)
+	}
 	return 0
+}
+
+// unmarkLocal removes the mark of f, which is not a placeholder, unless f
+// is about to become one (Evict marks it first).
+func (l *Listener) unmarkLocal(f *os.File) {
+	if key, ok := Key(f); ok {
+		if _, evicting := l.evicting.Load(key); evicting {
+			return
+		}
+	}
+	l.unmark(int(f.Fd()))
 }
 
 // hydrateVia opens name writable through v's private mount (the event fd is
@@ -724,8 +747,11 @@ func (l *Listener) hydrate(ctx context.Context, v *View, name string, f *os.File
 	if err := l.handler.Hydrate(ctx, v.Folder, name, f); err != nil {
 		return err
 	}
-	if IsVirtual(f) {
-		return fmt.Errorf("handler did not finish hydration: %w", unix.EIO)
+	// The marker before the state: finishing removes the state first, so
+	// a marker already gone means the state is too.
+	if !contentComplete(int(f.Fd())) && IsVirtual(f) {
+		m, ok, err := readMarker(int(f.Fd()))
+		return fmt.Errorf("handler did not finish hydration (marker %v %+v %v): %w", ok, m, err, unix.EIO)
 	}
 	return nil
 }
@@ -867,44 +893,145 @@ func ReadPlaceholderFile(f *os.File) (origin string, blocksHash []byte, isPlaceh
 	return origin, blocksHash, true
 }
 
+// hydrationMarker is the content of XattrHydrating.
+type hydrationMarker struct {
+	mtime    int64 // modification time before the hydration (ns)
+	noatime  bool  // BeginHydration set fsNoatimeFl
+	complete bool  // the content is complete (Complete), perhaps not durable
+}
+
+func (m hydrationMarker) bytes() []byte {
+	b := binary.LittleEndian.AppendUint64(nil, uint64(m.mtime))
+	for _, v := range []bool{m.noatime, m.complete} {
+		if v {
+			b = append(b, 1)
+		} else {
+			b = append(b, 0)
+		}
+	}
+	return b
+}
+
+// readMarker returns f's hydration marker; ok is false if there is none.
+func readMarker(fd int) (m hydrationMarker, ok bool, _ error) {
+	var b [10]byte
+	n, err := unix.Fgetxattr(fd, XattrHydrating, b[:])
+	if errors.Is(err, unix.ENODATA) {
+		return m, false, nil
+	} else if err != nil {
+		return m, false, err
+	}
+	if n < 8 {
+		return m, false, fmt.Errorf("corrupt %s", XattrHydrating)
+	}
+	m.mtime = int64(binary.LittleEndian.Uint64(b[:8]))
+	m.noatime = n > 8 && b[8] == 1
+	m.complete = n > 9 && b[9] == 1
+	return m, true, nil
+}
+
+func writeMarker(fd int, m hydrationMarker) error {
+	return writable(fd, func() error { return unix.Fsetxattr(fd, XattrHydrating, m.bytes(), 0) })
+}
+
+// ErrModified is returned for a placeholder whose content was complete and
+// has since been written to by an application: the file is no longer a
+// placeholder, but kept as it is, a local change.
+var ErrModified = errors.New("written to after its download completed; kept as a local change")
+
+// modifiedSinceComplete reports whether the file was written to after
+// Complete: Complete follows restoring the modification time recorded in
+// the marker, which any write changes.
+func modifiedSinceComplete(fd int, m hydrationMarker) bool {
+	var st unix.Stat_t
+	return m.complete && unix.Fstat(fd, &st) == nil && st.Mtim.Nano() != m.mtime
+}
+
+// keep turns a placeholder that was written to after its content was
+// complete into an ordinary file, without touching its times.
+func keep(fd int, m hydrationMarker) error {
+	if err := endHydration(fd, m); err != nil {
+		return err
+	}
+	if err := removePlaceholderXattrs(fd); err != nil {
+		return err
+	}
+	return ErrModified
+}
+
 // BeginHydration prepares the placeholder f for content being written
 // into it, and returns its modification time from before. The time is kept
 // in XattrHydrating, together with whether we set fsNoatimeFl, so that
 // Discard or Finish can restore both. A marker left by an earlier attempt
-// is kept: it holds the state from before that attempt.
+// is kept: it holds the state from before that attempt. If that attempt
+// completed and an application has written to the file since, the file is
+// kept as it is (ErrModified).
 func BeginHydration(f *os.File) (mtime time.Time, err error) {
 	fd := int(f.Fd())
-	var b [9]byte
-	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil && n >= 8 {
-		return time.Unix(0, int64(binary.LittleEndian.Uint64(b[:8]))), nil
+	m, ok, err := readMarker(fd)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if ok {
+		if modifiedSinceComplete(fd, m) {
+			return time.Time{}, keep(fd, m)
+		}
+		if m.complete {
+			// Complete but perhaps not durable: written again.
+			m.complete = false
+			if err := writeMarker(fd, m); err != nil {
+				return time.Time{}, err
+			}
+		}
+		return time.Unix(0, m.mtime), nil
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
 		return time.Time{}, err
 	}
-	binary.LittleEndian.PutUint64(b[:8], uint64(st.Mtim.Nano()))
+	m = hydrationMarker{mtime: st.Mtim.Nano()}
 	flags, err := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
-	if err == nil && flags&fsNoatimeFl == 0 {
-		b[8] = 1
-	}
+	m.noatime = err == nil && flags&fsNoatimeFl == 0
 	// The marker first: if we crash after setting the flag, it says to
 	// clear it again.
-	if err := unix.Fsetxattr(fd, XattrHydrating, b[:], 0); err != nil {
+	if err := writeMarker(fd, m); err != nil {
 		return time.Time{}, err
 	}
-	if b[8] == 1 && unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, flags|fsNoatimeFl) != nil {
+	if m.noatime && unix.IoctlSetPointerInt(fd, unix.FS_IOC_SETFLAGS, flags|fsNoatimeFl) != nil {
 		// Only the guard's view of a crash mid-hydration depends on it.
-		b[8] = 0
-		if err := unix.Fsetxattr(fd, XattrHydrating, b[:], 0); err != nil {
+		m.noatime = false
+		if err := writeMarker(fd, m); err != nil {
 			return time.Time{}, err
 		}
 	}
 	return time.Unix(st.Mtim.Unix()), nil
 }
 
+// Complete records that f's content is complete, once its times are
+// restored (SetTimes), while it is still a placeholder until made durable
+// (Finish). From here on a write by an application is recognised as such:
+// Finish keeps its modification time, and a crash leaves a file that is
+// kept rather than discarded.
+func Complete(f *os.File) error {
+	fd := int(f.Fd())
+	m, ok, err := readMarker(fd)
+	if err != nil || !ok {
+		return err
+	}
+	m.complete = true
+	return writeMarker(fd, m)
+}
+
+// contentComplete reports whether the placeholder fd's content is complete
+// but not yet durable (Complete).
+func contentComplete(fd int) bool {
+	m, ok, err := readMarker(fd)
+	return err == nil && ok && m.complete
+}
+
 // endHydration clears fsNoatimeFl if BeginHydration set it.
-func endHydration(fd int, marker []byte) error {
-	if len(marker) < 9 || marker[8] != 1 {
+func endHydration(fd int, m hydrationMarker) error {
+	if !m.noatime {
 		return nil
 	}
 	flags, err := unix.IoctlGetInt(fd, unix.FS_IOC_GETFLAGS)
@@ -925,18 +1052,16 @@ func Interrupted(path string) bool {
 // content is freed and the modification time restored, so that the file is
 // exactly the placeholder it was. Otherwise the scanner would take the
 // bumped modification time for a local change and announce a new version.
-// Nobody else may be hydrating f.
+// A file written to after its content was complete is kept instead
+// (ErrModified). Nobody else may be hydrating f.
 func Discard(f *os.File) error {
 	fd := int(f.Fd())
-	var b [9]byte
-	n, err := unix.Fgetxattr(fd, XattrHydrating, b[:])
-	if errors.Is(err, unix.ENODATA) {
-		return nil // nothing was written
-	} else if err != nil {
-		return err
+	m, ok, err := readMarker(fd)
+	if err != nil || !ok {
+		return err // no marker: nothing was written
 	}
-	if n < 8 {
-		return fmt.Errorf("corrupt %s", XattrHydrating)
+	if modifiedSinceComplete(fd, m) {
+		return keep(fd, m)
 	}
 	var st unix.Stat_t
 	if err := unix.Fstat(fd, &st); err != nil {
@@ -948,14 +1073,14 @@ func Discard(f *os.File) error {
 	if err := unix.Ftruncate(fd, st.Size); err != nil {
 		return err
 	}
-	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(int64(binary.LittleEndian.Uint64(b[:8])))}
+	ts := []unix.Timespec{{Nsec: unix.UTIME_OMIT}, unix.NsecToTimespec(m.mtime)}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
 		return err
 	}
-	if err := endHydration(fd, b[:n]); err != nil {
+	if err := endHydration(fd, m); err != nil {
 		return err
 	}
-	return unix.Fremovexattr(fd, XattrHydrating)
+	return writable(fd, func() error { return unix.Fremovexattr(fd, XattrHydrating) })
 }
 
 // Retarget makes the placeholder f stand for other content: a different
@@ -980,6 +1105,30 @@ func Ctime(path string) (time.Time, error) {
 	return time.Unix(st.Ctim.Unix()), nil
 }
 
+// Key identifies the file f is open on (device and inode).
+func Key(f *os.File) (key [2]uint64, ok bool) {
+	var st unix.Stat_t
+	if unix.Fstat(int(f.Fd()), &st) != nil {
+		return key, false
+	}
+	return [2]uint64{st.Dev, st.Ino}, true
+}
+
+// Dup returns a second descriptor for f's open file.
+func Dup(f *os.File) (*os.File, error) {
+	fd, err := unix.FcntlInt(f.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return nil, err
+	}
+	return os.NewFile(uintptr(fd), f.Name()), nil
+}
+
+// SetTimes sets f's access and modification times.
+func SetTimes(f *os.File, mtime, atime time.Time) error {
+	ts := []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
+	return unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", int(f.Fd())), ts, 0)
+}
+
 // Unlinked reports whether f has no name left.
 func Unlinked(f *os.File) bool {
 	var st unix.Stat_t
@@ -991,24 +1140,62 @@ func Unlinked(f *os.File) bool {
 // the access time set to atime.
 func Finish(f *os.File, mtime, atime time.Time) error {
 	fd := int(f.Fd())
+	m, ok, err := readMarker(fd)
+	if err != nil {
+		return err
+	}
+	if ok && modifiedSinceComplete(fd, m) {
+		// Written to by an application meanwhile: its times stand.
+		if err := keep(fd, m); !errors.Is(err, ErrModified) {
+			return err
+		}
+		return nil
+	}
 	ts := []unix.Timespec{unix.NsecToTimespec(atime.UnixNano()), unix.NsecToTimespec(mtime.UnixNano())}
 	if err := unix.UtimesNanoAt(unix.AT_FDCWD, fmt.Sprintf("/proc/self/fd/%d", fd), ts, 0); err != nil {
 		return err
 	}
-	var b [9]byte
-	if n, err := unix.Fgetxattr(fd, XattrHydrating, b[:]); err == nil {
-		if err := endHydration(fd, b[:n]); err != nil {
+	if ok {
+		if err := endHydration(fd, m); err != nil {
 			return err
 		}
 	}
-	// The hydration marker goes last: until the state is gone, it tells
-	// the scanner that the modification time is not to be trusted.
-	for _, name := range []string{XattrOrigin, XattrBlocksHash, XattrState, XattrHydrating} {
-		if err := unix.Fremovexattr(fd, name); err != nil && !errors.Is(err, unix.ENODATA) {
-			return err
+	return removePlaceholderXattrs(fd)
+}
+
+// removePlaceholderXattrs turns fd into an ordinary file. The hydration
+// marker goes last: until the state is gone, it tells the scanner that the
+// modification time is not to be trusted.
+func removePlaceholderXattrs(fd int) error {
+	return writable(fd, func() error {
+		for _, name := range []string{XattrOrigin, XattrBlocksHash, XattrState, XattrHydrating} {
+			if err := unix.Fremovexattr(fd, name); err != nil && !errors.Is(err, unix.ENODATA) {
+				return err
+			}
 		}
+		return nil
+	})
+}
+
+// writable runs fn, which changes user xattrs of the file fd. Those need
+// write permission on the file, which a read-only file of ours (e.g. a git
+// object) lacks even through a writable descriptor: if so, fn runs again
+// with the owner's write bit set for the moment.
+func writable(fd int, fn func() error) error {
+	err := fn()
+	if !errors.Is(err, unix.EACCES) {
+		return err
 	}
-	return nil
+	var st unix.Stat_t
+	if unix.Fstat(fd, &st) != nil || int(st.Uid) != os.Geteuid() || st.Mode&0o200 != 0 {
+		return err
+	}
+	mode := st.Mode & 0o7777
+	if unix.Fchmod(fd, mode|0o200) != nil {
+		return err
+	}
+	defer unix.Fchmod(fd, mode) //nolint:errcheck
+	return fn()
 }
 
 // MarkVirtual turns an open file into a placeholder of the given size:

@@ -401,7 +401,21 @@ func TestOpenForWriteReadOnlyFile(t *testing.T) {
 		if _, err := f.WriteAt([]byte("written"), 0); err != nil {
 			t.Fatal(err)
 		}
+		// Placeholder state set while writable, cleared after the mode is
+		// back (as the background finisher does).
+		if err := unix.Fsetxattr(int(f.Fd()), XattrState, []byte(StateVirtual), 0); err != nil {
+			t.Fatal(err)
+		}
 		restore()
+		if err := Finish(f, time.Unix(1700000000, 0), time.Now()); err != nil {
+			t.Fatal("finish on a read-only file:", err)
+		}
+		if IsVirtual(f) {
+			t.Fatal("still a placeholder")
+		}
+		if st, _ := f.Stat(); st.Mode().Perm() != 0o444 {
+			t.Fatalf("mode %v after finish", st.Mode())
+		}
 		f.Close()
 		return
 	}
@@ -871,4 +885,100 @@ func TestDenyPending(t *testing.T) {
 			t.Fatalf("closing the group should have allowed the open: %v", err)
 		}
 	}
+}
+
+// Between Complete and Finish (while the content is made durable) an
+// application may write to the file. Its change must survive Finish, and a
+// crash (Discard); an unwritten file is discarded as usual.
+func TestWriteAfterComplete(t *testing.T) {
+	t0 := time.Unix(1_700_000_000, 0)
+	setup := func(t *testing.T) (*os.File, string) {
+		path := filepath.Join(t.TempDir(), "f")
+		if err := os.WriteFile(path, nil, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		f, err := os.OpenFile(path, os.O_RDWR, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { f.Close() })
+		if err := MarkVirtual(f, 4, "f", []byte("bh")); err != nil {
+			if errors.Is(err, unix.EOPNOTSUPP) {
+				t.Skip("no user xattrs here")
+			}
+			t.Fatal(err)
+		}
+		os.Chtimes(path, t0, t0)
+		if _, err := BeginHydration(f); err != nil {
+			t.Fatal(err)
+		}
+		f.WriteAt([]byte("good"), 0)
+		if err := SetTimes(f, t0, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if err := Complete(f); err != nil {
+			t.Fatal(err)
+		}
+		return f, path
+	}
+	appWrites := func(f *os.File) {
+		time.Sleep(10 * time.Millisecond)
+		f.WriteAt([]byte("EDIT"), 0) // bumps the mtime, as any write
+	}
+	content := func(path string) string {
+		b, _ := os.ReadFile(path)
+		return string(b)
+	}
+
+	t.Run("finish keeps the write", func(t *testing.T) {
+		f, path := setup(t)
+		appWrites(f)
+		if err := Finish(f, t0, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := f.Stat()
+		if IsVirtual(f) || Interrupted(path) || st.ModTime().Equal(t0) || content(path) != "EDIT" {
+			t.Fatalf("virtual %v, marker %v, mtime %v, content %q", IsVirtual(f), Interrupted(path), st.ModTime(), content(path))
+		}
+	})
+	t.Run("discard keeps the write", func(t *testing.T) {
+		f, path := setup(t)
+		appWrites(f)
+		if err := Discard(f); !errors.Is(err, ErrModified) {
+			t.Fatalf("discard: %v, want ErrModified", err)
+		}
+		if IsVirtual(f) || content(path) != "EDIT" {
+			t.Fatalf("virtual %v, content %q", IsVirtual(f), content(path))
+		}
+	})
+	t.Run("another attempt keeps the write", func(t *testing.T) {
+		f, path := setup(t)
+		appWrites(f)
+		if _, err := BeginHydration(f); !errors.Is(err, ErrModified) {
+			t.Fatalf("begin: %v, want ErrModified", err)
+		}
+		if IsVirtual(f) || content(path) != "EDIT" {
+			t.Fatalf("virtual %v, content %q", IsVirtual(f), content(path))
+		}
+	})
+	t.Run("unwritten is discarded", func(t *testing.T) {
+		f, path := setup(t)
+		if err := Discard(f); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := f.Stat()
+		if !IsVirtual(f) || Interrupted(path) || !st.ModTime().Equal(t0) || st.Size() != 4 {
+			t.Fatalf("virtual %v, marker %v, mtime %v, size %d", IsVirtual(f), Interrupted(path), st.ModTime(), st.Size())
+		}
+	})
+	t.Run("unwritten finishes", func(t *testing.T) {
+		f, path := setup(t)
+		if err := Finish(f, t0, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		st, _ := f.Stat()
+		if IsVirtual(f) || Interrupted(path) || !st.ModTime().Equal(t0) || content(path) != "good" {
+			t.Fatalf("virtual %v, marker %v, mtime %v, content %q", IsVirtual(f), Interrupted(path), st.ModTime(), content(path))
+		}
+	})
 }
