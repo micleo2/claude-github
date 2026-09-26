@@ -41,7 +41,7 @@ syncthing serve --home ~/.local/state/tether --no-browser
 
 ## 3. Client daemon
 
-The client needs `CAP_SYS_ADMIN` (fanotify pre-content groups and mount marks are privileged). Rather than running the
+The client needs `CAP_SYS_ADMIN` (fanotify pre-content groups are privileged, and the view is a mount). Rather than running the
 daemon as root, give a root-owned copy of the binary that capability and run it as yourself, so downloaded files are
 yours:
 
@@ -118,10 +118,9 @@ Folder settings, all changeable without restarting the folder (REST, `config.xml
 
 ## Known rough edges
 
-- **Sandboxes read placeholders as zeros.** Processes in another mount namespace (docker `-v`, flatpak/bwrap,
-  `unshare`) get an unmarked copy of the view. See
-  [research/placeholder-access-paths.md](research/placeholder-access-paths.md); the fix (per-placeholder inode marks) is
-  in progress. Until then, don't open on-demand folders from sandboxed apps.
+- **While the daemon is stopped,** placeholders read as zeros through the data directory and through copies of the view
+  that containers or sandboxes still hold. Stop such containers before stopping tether. See
+  [research/placeholder-access-paths.md](research/placeholder-access-paths.md).
 - **Privileges.** With `setcap`, anyone who can run that binary gets `CAP_SYS_ADMIN` in it. The planned fix is a small
   privileged helper plus an unprivileged per-user daemon.
 - **Settings UI.** The GUI has no dedicated on-demand controls. The fields should show up in the folder's *Advanced*

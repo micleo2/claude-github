@@ -152,14 +152,24 @@ func (m *model) hsmRemoveView(cfg config.FolderConfiguration) {
 	m.writeViewsFileLocked()
 }
 
-func (m *model) hsmForget(fd *os.File) {
+// hsmMakePlaceholder turns fd into a marked placeholder. Without the
+// listener it fails: an unmarked placeholder reads as zeros.
+func (m *model) hsmMakePlaceholder(fd *os.File, file protocol.FileInfo) error {
+	m.od.mut.Lock()
+	l := m.od.l
+	m.od.mut.Unlock()
+	if l == nil {
+		return errors.New("on-demand listener is not running")
+	}
+	return l.MakePlaceholder(fd, file.Size, file.Name, blocksHashOf(file))
+}
+
+func (m *model) hsmUnmark(fd *os.File) {
 	m.od.mut.Lock()
 	l := m.od.l
 	m.od.mut.Unlock()
 	if l != nil {
-		if err := l.Forget(fd); err != nil {
-			slog.Warn("Failed to re-arm on-demand interception", slogutil.Error(err))
-		}
+		l.Unmark(fd)
 	}
 }
 

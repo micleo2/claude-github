@@ -43,10 +43,14 @@ func Supported() error { return errUnsupported }
 
 func New(Handler, Policy, *slog.Logger) (*Listener, error) { return nil, errUnsupported }
 
-func (*Listener) AddView(*View) error             { return errUnsupported }
-func (*Listener) RemoveView(string) error         { return errUnsupported }
-func (*Listener) Close() error                    { return nil }
-func (*Listener) Forget(*os.File) error           { return errUnsupported }
+func (*Listener) AddView(*View) error     { return errUnsupported }
+func (*Listener) RemoveView(string) error { return errUnsupported }
+func (*Listener) Close() error            { return nil }
+func (*Listener) MakePlaceholder(*os.File, int64, string, []byte) error {
+	return errUnsupported
+}
+func (*Listener) Unmark(*os.File)                 {}
+func (*Listener) MarkTree(string) (int, error)    { return 0, errUnsupported }
 func (*Listener) Serve(ctx context.Context) error { <-ctx.Done(); return ctx.Err() }
 
 func IsVirtual(*os.File) bool                             { return false }

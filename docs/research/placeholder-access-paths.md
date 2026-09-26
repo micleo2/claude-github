@@ -1,5 +1,8 @@
 # Placeholders read from other mount namespaces: survey, spikes and options
 
+**Status:** option 1 (per-placeholder inode marks) is implemented; see §8. The daemon-down guards (options 4–6) are
+not yet.
+
 Problem: tether marks one mount, the view, with a fanotify mount mark. A mount mark belongs to that one mount. Any copy of
 it in another mount namespace has no mark, and a placeholder read through that copy returns zeros:
 
@@ -181,6 +184,48 @@ tether has to earn correctness at the first-access boundary, and the per-placeho
    nothing for small files. Measure memory on a real large tree before promising million-file trees.
 
 FUSE (option 3) stays the fallback if lazy directory listings become a requirement before the kernel supports them.
+
+## 8. Implementation notes (option 1)
+
+What the implementation found beyond the spikes:
+
+- **The reported path is the accessor's.** For a process in another mount namespace, the event fd's path is the path
+  in *that* namespace (`/tmp/cx/p-docker`). So the listener identifies the folder and file by inode and uses paths
+  only as hints. The candidates, in order:
+  1. the path under a view or data directory;
+  2. the name the placeholder was created under;
+  3. every trailing part of the path.
+
+  Each candidate must lead to the same inode. If none does, the access fails with `EIO`. That happens for a moved
+  placeholder reached through a bind of its directory.
+- **Eviction deadlocked for 45 s.** Eviction holds a write lease, and truncating a marked file raises a pre-access
+  event. Delivering an event opens the file, which waits for our own lease to break. `MakePlaceholder` now marks for
+  opens first and adds pre-access after the truncation. That is safe because the lease guarantees there are no other
+  open files.
+- **One read-only mount stopped the listener.** Read-write event fds can't be opened for accesses through a read-only
+  mount (`docker -v …:ro`). The kernel denied the access, `read()` on the group failed with `EROFS`, and the listener
+  exited, which left every later access blocked forever.
+  - Fixes:
+    - event fds are read-only;
+    - `FAN_REPORT_FD_ERROR` reports per-event failures in the event itself;
+    - the listener never stops while marks exist.
+  - Content is written through a private detached clone of the data directory, carrying a mount ignore mark, after
+    checking it is the event's inode.
+- **The sync engine's own accesses** to marked placeholders are let through by process ID. That keeps the earlier
+  behaviour, where the engine used an unmarked path.
+- **Startup order:** probe for support (an `O_TMPFILE` inode), create the private clone, register the folder, mark
+  every placeholder, then mount the view. On the V8 client, 19,442 placeholders were marked within the same second as
+  startup.
+- **Tests:**
+  - listener tests for:
+    - the data path;
+    - another namespace's copy;
+    - a moved placeholder through a container-style bind;
+    - an unmatched path (fails with `EIO`);
+    - existing placeholders at startup;
+    - a read-only mount;
+    - eviction under a lease finishing promptly;
+  - the e2e test `other_mount_namespace_hydrates`, which fails on the previous release.
 
 ## Sources
 

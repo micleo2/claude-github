@@ -9,16 +9,20 @@
 // Package hsm implements on-demand hydration of placeholder files using
 // fanotify pre-content events (Linux >= 6.14).
 //
-// A folder's real directory (the "lower" path) is used by the sync engine.
-// Users see it through a bind mount (the "view"), and only the view carries
-// the fanotify mark, so the engine's own I/O never generates events. The view
-// is marked before it becomes visible (bind at a private staging path, mark,
-// then move-mount into place) so there is no window in which placeholders can
-// be read as zeros.
-//
 // A placeholder is a sparse file of the right size and mtime whose xattr
-// user.tether.state is "virtual". Opening or accessing it blocks the caller
-// until the Handler has written the full content through the event fd.
+// user.tether.state is "virtual". Each placeholder's inode carries a fanotify
+// mark, so opening or accessing it through any path blocks the caller until
+// the Handler has written the full content through the event fd. That
+// includes paths in other mount namespaces (containers, flatpak), which a
+// mount mark would miss: see docs/research/placeholder-access-paths.md.
+// Marks are added before a file becomes a placeholder and removed once it
+// is hydrated, so other files never generate events.
+//
+// A folder's real directory (the "lower" path) is used by the sync engine,
+// whose own accesses are let through without hydration. Users work in a bind
+// mount of it (the "view"). The listener writes downloaded content through a
+// private, detached clone of lower whose accesses raise no events: the event
+// fds are read-only, so that accesses through read-only mounts work too.
 package hsm
 
 import (
@@ -29,8 +33,10 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -52,8 +58,7 @@ const (
 	// bookkeeping and must never be synced.
 	XattrPrefix = "user.tether."
 
-	eventMask  = unix.FAN_OPEN_PERM | unix.FAN_PRE_ACCESS
-	ignoreMask = eventMask
+	eventMask = unix.FAN_OPEN_PERM | unix.FAN_PRE_ACCESS
 )
 
 // Handler supplies file content.
@@ -70,11 +75,15 @@ type Handler interface {
 // errno.
 type Policy func(folder string, pid int, exe string) unix.Errno
 
-// View is a marked bind mount of a folder.
+// View is a bind mount of a folder.
 type View struct {
 	Folder string // folder ID
 	Lower  string // real directory used by the sync engine
 	Path   string // user-visible mount point
+
+	// A detached clone of Lower with an ignore mark: opening files through
+	// it never raises events. Owned by the Listener.
+	private int
 }
 
 type Listener struct {
@@ -82,6 +91,9 @@ type Listener struct {
 	handler Handler
 	policy  Policy
 	log     *slog.Logger
+	// self is the process whose accesses never hydrate: the sync engine
+	// reads and writes placeholders as ordinary files.
+	self atomic.Int32
 
 	mu    sync.Mutex
 	views []*View
@@ -113,34 +125,73 @@ func Supported() error {
 }
 
 func New(handler Handler, policy Policy, log *slog.Logger) (*Listener, error) {
-	fd, err := unix.FanotifyInit(unix.FAN_CLASS_PRE_CONTENT|unix.FAN_CLOEXEC|unix.FAN_UNLIMITED_QUEUE,
-		unix.O_RDWR|unix.O_LARGEFILE)
+	// Event fds are read-only: a read-write one cannot be opened for an
+	// access through a read-only mount (docker -v ...:ro). FD_ERROR reports
+	// such failures in the event instead of failing read().
+	fd, err := unix.FanotifyInit(unix.FAN_CLASS_PRE_CONTENT|unix.FAN_CLOEXEC|unix.FAN_UNLIMITED_QUEUE|
+		unix.FAN_UNLIMITED_MARKS|unix.FAN_REPORT_FD_ERROR, unix.O_RDONLY|unix.O_LARGEFILE)
 	if err != nil {
 		return nil, fmt.Errorf("fanotify_init: %w", err)
 	}
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Listener{fd: fd, handler: handler, policy: policy, log: log}, nil
+	l := &Listener{fd: fd, handler: handler, policy: policy, log: log}
+	l.self.Store(int32(os.Getpid()))
+	return l, nil
 }
 
-// AddView mounts lower at path with the fanotify mark in place before the
-// mount is reachable at path.
+// AddView starts serving a folder: it marks every placeholder under
+// v.Lower (marks do not outlive the listener), then mounts v.Lower at v.Path.
+// Placeholders are protected by their own marks, not by the view.
 //
 // The view is two mounts. The bottom one is path bound onto itself and made
-// private, so that the marked mount above it never propagates: a fanotify mark
-// belongs to one mount, and a copy propagated into another mount namespace
-// (containers, flatpak) would show placeholders unmarked, i.e. as zeros. Such
-// namespaces see only the bottom mount, an empty directory. The marked mount is
-// a detached clone of lower that is marked before being attached; unlike
-// MS_MOVE this works when the parent mounts are shared, as they are on any
-// systemd host.
+// private, and the top one is a private clone of lower. Neither propagates, so
+// when the monitor unmounts a crashed daemon's view nothing is left behind in
+// other mount namespaces that existed before it. Attaching a detached clone
+// (rather than MS_MOVE) works when the parent mounts are shared, as they are
+// on any systemd host.
 func (l *Listener) AddView(v *View) error {
+	if err := l.probe(v.Lower); err != nil {
+		return err
+	}
+	priv, err := unix.OpenTree(unix.AT_FDCWD, v.Lower, unix.OPEN_TREE_CLONE|unix.OPEN_TREE_CLOEXEC)
+	if err != nil {
+		return fmt.Errorf("clone %s: %w", v.Lower, err)
+	}
+	if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT|unix.FAN_MARK_IGNORE_SURV, eventMask, priv, "."); err != nil {
+		unix.Close(priv)
+		return fmt.Errorf("ignore mark on private mount of %s: %w", v.Lower, err)
+	}
+	v.private = priv
+	// Registered before marking, so that events can be served at once.
+	l.mu.Lock()
+	l.views = append(l.views, v)
+	l.mu.Unlock()
+	if err := l.mountView(v); err != nil {
+		l.forget(v)
+		return err
+	}
+	return nil
+}
+
+func (l *Listener) forget(v *View) {
+	l.mu.Lock()
+	l.views = slices.DeleteFunc(l.views, func(x *View) bool { return x == v })
+	l.mu.Unlock()
+	unix.Close(v.private)
+}
+
+func (l *Listener) mountView(v *View) error {
+	n, err := l.MarkTree(v.Lower)
+	if err != nil {
+		return err
+	}
+	l.log.Info("Marked placeholders for on-demand download", "folder", v.Folder, "count", n)
 	if err := os.MkdirAll(v.Path, 0o755); err != nil {
 		return err
 	}
-	// Anything mounted here is left over from a crash; it is unmarked and
-	// therefore unsafe.
+	// Anything mounted here is left over from a crash.
 	if err := UnmountView(v.Path); err != nil {
 		return fmt.Errorf("remove stale view %s: %w", v.Path, err)
 	}
@@ -167,24 +218,14 @@ func (l *Listener) AddView(v *View) error {
 	}
 	defer unix.Close(tree)
 	// A clone keeps the source's propagation and would join the peer group
-	// of lower's mount. Unbindable also keeps the view out of bind-based
-	// sandboxes (flatpak, docker -v, podman): their binds skip it and show
-	// the empty directory below, where a copy would be unmarked.
-	if err := unix.MountSetattr(tree, "", unix.AT_EMPTY_PATH, &unix.MountAttr{Propagation: unix.MS_UNBINDABLE}); err != nil {
-		return fail(fmt.Errorf("make view of %s unbindable: %w", v.Lower, err))
-	}
-	// tree is an O_PATH fd, which fanotify_mark rejects without a path;
-	// "." resolves through it to the root of the detached mount.
-	if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_MOUNT, eventMask, tree, "."); err != nil {
-		return fail(fmt.Errorf("fanotify_mark %s: %w", v.Lower, err))
+	// of lower's mount.
+	if err := unix.MountSetattr(tree, "", unix.AT_EMPTY_PATH, &unix.MountAttr{Propagation: unix.MS_PRIVATE}); err != nil {
+		return fail(fmt.Errorf("make view of %s private: %w", v.Lower, err))
 	}
 	if err := unix.MoveMount(tree, "", unix.AT_FDCWD, v.Path, unix.MOVE_MOUNT_F_EMPTY_PATH); err != nil {
 		return fail(fmt.Errorf("attach view at %s: %w", v.Path, err))
 	}
-	l.mu.Lock()
-	l.views = append(l.views, v)
-	l.mu.Unlock()
-	l.log.Info("Placeholder view mounted", "folder", v.Folder, "lower", v.Lower, "view", v.Path)
+	l.log.Info("On-demand view mounted", "folder", v.Folder, "lower", v.Lower, "view", v.Path)
 	return nil
 }
 
@@ -194,6 +235,7 @@ func (l *Listener) RemoveView(path string) error {
 	for i, v := range l.views {
 		if v.Path == path {
 			l.views = append(l.views[:i], l.views[i+1:]...)
+			unix.Close(v.private)
 			break
 		}
 	}
@@ -225,21 +267,83 @@ func (l *Listener) Close() error {
 		l.mu.Unlock()
 		for _, v := range views {
 			_ = UnmountView(v.Path)
+			unix.Close(v.private)
 		}
 		l.closeErr = unix.Close(l.fd)
 	})
 	return l.closeErr
 }
 
-// Forget removes the ignore mark for a file that just became a placeholder
-// again (eviction), so accesses are intercepted once more. f may be opened
-// through any path.
-func (l *Listener) Forget(f *os.File) error {
-	err := unix.FanotifyMark(l.fd, unix.FAN_MARK_REMOVE|unix.FAN_MARK_IGNORE, ignoreMask, int(f.Fd()), "")
-	if errors.Is(err, unix.ENOENT) {
-		return nil
+// MakePlaceholder turns f into a marked placeholder (see MarkVirtual), so
+// that accesses through any path wait for hydration. There is never a
+// moment in which f is a placeholder without a mark. Nobody else may have f
+// open: it is either a fresh temporary file or held under a Lease.
+func (l *Listener) MakePlaceholder(f *os.File, size int64, origin string, blocksHash []byte) error {
+	fd := int(f.Fd())
+	// Opens first. Access events are added only after the truncation in
+	// MarkVirtual, which would otherwise raise one: delivering it opens the
+	// file, which waits for our own lease to break (45 s).
+	if err := l.markMask(fd, unix.FAN_OPEN_PERM); err != nil {
+		return err
 	}
-	return err
+	if err := MarkVirtual(f, size, origin, blocksHash); err != nil {
+		return err
+	}
+	return l.markMask(fd, unix.FAN_PRE_ACCESS)
+}
+
+func (l *Listener) markMask(fd int, mask uint64) error {
+	if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD, mask, fd, ""); err != nil {
+		return fmt.Errorf("fanotify_mark: %w", err)
+	}
+	return nil
+}
+
+// Unmark removes f's mark once it is no longer a placeholder.
+func (l *Listener) Unmark(f *os.File) {
+	l.unmark(int(f.Fd()))
+}
+
+func (l *Listener) unmark(fd int) {
+	_ = unix.FanotifyMark(l.fd, unix.FAN_MARK_REMOVE, eventMask, fd, "")
+}
+
+// probe checks that lower's filesystem supports pre-content marks, using an
+// unnamed temporary file.
+func (l *Listener) probe(lower string) error {
+	probe, err := unix.Open(lower, unix.O_TMPFILE|unix.O_RDWR|unix.O_CLOEXEC, 0o600)
+	if err != nil {
+		return fmt.Errorf("create probe file in %s: %w", lower, err)
+	}
+	err = l.markMask(probe, eventMask)
+	l.unmark(probe)
+	unix.Close(probe)
+	if err != nil {
+		return fmt.Errorf("%s does not support on-demand files (ext4, xfs or btrfs needed): %w", lower, err)
+	}
+	return nil
+}
+
+// MarkTree marks every placeholder under lower and returns how many there
+// were. AddView does this before mounting the view.
+func (l *Listener) MarkTree(lower string) (int, error) {
+	n := 0
+	err := filepath.WalkDir(lower, func(path string, d os.DirEntry, err error) error {
+		if err != nil || !d.Type().IsRegular() {
+			return nil // unreadable entries are the scanner's business
+		}
+		var b [16]byte
+		sz, err := unix.Lgetxattr(path, XattrState, b[:])
+		if err != nil || string(b[:sz]) != StateVirtual {
+			return nil
+		}
+		if err := unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_DONT_FOLLOW, eventMask, unix.AT_FDCWD, path); err != nil {
+			return fmt.Errorf("mark %s: %w", path, err)
+		}
+		n++
+		return nil
+	})
+	return n, err
 }
 
 // Serve reads events until ctx is cancelled or the group is closed.
@@ -252,13 +356,19 @@ func (l *Listener) Serve(ctx context.Context) error {
 	for {
 		n, err := unix.Read(l.fd, buf)
 		if err != nil {
-			if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
-				continue
-			}
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			return fmt.Errorf("fanotify read: %w", err)
+			if errors.Is(err, unix.EBADF) {
+				return fmt.Errorf("fanotify read: %w", err)
+			}
+			// Never stop serving while the marks exist: every access to a
+			// placeholder would wait forever.
+			if !errors.Is(err, unix.EINTR) && !errors.Is(err, unix.EAGAIN) {
+				l.log.Warn("fanotify read failed", "error", err)
+				time.Sleep(10 * time.Millisecond)
+			}
+			continue
 		}
 		for off := 0; off+int(unsafe.Sizeof(unix.FanotifyEventMetadata{})) <= n; {
 			md := *(*unix.FanotifyEventMetadata)(unsafe.Pointer(&buf[off]))
@@ -267,7 +377,12 @@ func (l *Listener) Serve(ctx context.Context) error {
 			}
 			off += int(md.Event_len)
 			if md.Fd < 0 {
-				continue // queue overflow; permission events are never dropped
+				// Queue overflow, or (FD_ERROR) the kernel could not open
+				// the file for us; it has already denied the access.
+				if md.Fd != unix.FAN_NOFD {
+					l.log.Warn("Access to a placeholder denied: cannot open it", "pid", md.Pid, "error", unix.Errno(-md.Fd))
+				}
+				continue
 			}
 			go l.handle(ctx, md)
 		}
@@ -316,17 +431,20 @@ func responses(errno unix.Errno) []uint32 {
 
 func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 	fd := int(f.Fd())
-	if !IsVirtual(f) {
-		l.ignore(fd)
+	if int32(pid) == l.self.Load() {
 		return 0
 	}
-	path, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
-	if err != nil {
+	if !IsVirtual(f) {
+		l.unmark(fd)
+		return 0
+	}
+	var st unix.Stat_t
+	if err := unix.Fstat(fd, &st); err != nil {
 		return unix.EIO
 	}
-	v, name := l.resolve(path)
+	v, name := l.resolve(f, &st)
 	if v == nil {
-		// A virtual file reached through a view we no longer own.
+		l.log.Warn("Placeholder opened through a path that cannot be matched to a folder; denied", "pid", pid, "path", fdPath(fd))
 		return unix.EIO
 	}
 	if l.policy != nil {
@@ -337,10 +455,6 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		}
 	}
 
-	var st unix.Stat_t
-	if err := unix.Fstat(fd, &st); err != nil {
-		return unix.EIO
-	}
 	gen, _ := unix.IoctlGetInt(fd, fsIocGetVersion) //nolint:gosec
 	key := fileKey{dev: st.Dev, ino: st.Ino, gen: gen}
 
@@ -350,7 +464,7 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		fl = prev.(*flight)
 		<-fl.done
 	} else {
-		fl.err = l.hydrate(ctx, v, name, f)
+		fl.err = l.hydrateVia(ctx, v, name, &st)
 		l.flights.Delete(key)
 		close(fl.done)
 	}
@@ -362,8 +476,27 @@ func (l *Listener) decide(ctx context.Context, f *os.File, pid int) unix.Errno {
 		}
 		return unix.EIO
 	}
-	l.ignore(fd)
+	l.unmark(fd)
 	return 0
+}
+
+// hydrateVia opens name writable through v's private mount (the event fd is
+// read-only) and hydrates it, checking that it is the inode of the event.
+func (l *Listener) hydrateVia(ctx context.Context, v *View, name string, st *unix.Stat_t) error {
+	fd, err := unix.Openat(v.private, name, unix.O_RDWR|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return err
+	}
+	f := os.NewFile(uintptr(fd), name)
+	defer f.Close()
+	var wst unix.Stat_t
+	if err := unix.Fstat(fd, &wst); err != nil {
+		return err
+	}
+	if wst.Dev != st.Dev || wst.Ino != st.Ino {
+		return fmt.Errorf("%s was replaced during hydration: %w", name, unix.EIO)
+	}
+	return l.hydrate(ctx, v, name, f)
 }
 
 func (l *Listener) hydrate(ctx context.Context, v *View, name string, f *os.File) error {
@@ -379,16 +512,44 @@ func (l *Listener) hydrate(ctx context.Context, v *View, name string, f *os.File
 	return nil
 }
 
-func (l *Listener) ignore(fd int) {
-	_ = unix.FanotifyMark(l.fd, unix.FAN_MARK_ADD|unix.FAN_MARK_IGNORE_SURV|unix.FAN_MARK_EVICTABLE, ignoreMask, fd, "")
+func fdPath(fd int) string {
+	p, _ := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd))
+	return p
 }
 
-func (l *Listener) resolve(path string) (*View, string) {
+// resolve finds the folder and name of the placeholder open as f (stat st).
+// The event's path is as the accessing process sees it, which for a process
+// in another mount namespace means nothing here, so paths are only hints:
+// each candidate name must lead to the same inode. Candidates are the path
+// under a view or lower directory, the name the placeholder was created
+// under, and every trailing part of the path (a container's bind mount of
+// the folder).
+func (l *Listener) resolve(f *os.File, st *unix.Stat_t) (*View, string) {
+	path := fdPath(int(f.Fd()))
+	origin, _, _ := ReadPlaceholderFile(f)
+	parts := strings.Split(strings.TrimPrefix(path, "/"), "/")
 	l.mu.Lock()
-	defer l.mu.Unlock()
-	for _, v := range l.views {
-		if rel, ok := strings.CutPrefix(path, v.Path+"/"); ok {
-			return v, rel
+	views := slices.Clone(l.views)
+	l.mu.Unlock()
+	for _, v := range views {
+		var cands []string
+		for _, root := range []string{v.Path, v.Lower} {
+			if rel, ok := strings.CutPrefix(path, root+"/"); ok {
+				cands = append(cands, rel)
+			}
+		}
+		cands = append(cands, origin)
+		for i := range parts {
+			cands = append(cands, strings.Join(parts[i:], "/"))
+		}
+		for _, name := range cands {
+			if name == "" || !filepath.IsLocal(name) {
+				continue
+			}
+			var cst unix.Stat_t
+			if unix.Lstat(filepath.Join(v.Lower, name), &cst) == nil && cst.Dev == st.Dev && cst.Ino == st.Ino {
+				return v, name
+			}
 		}
 	}
 	return nil, ""

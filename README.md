@@ -26,7 +26,7 @@ Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` fo
 | Path | What |
 |---|---|
 | `tether/` | The Syncthing fork (from v2.1.5; see `tether/UPSTREAM`) |
-| `tether/lib/hsm/` | fanotify listener, marked bind-mount views, placeholder xattrs, lease-based eviction helpers |
+| `tether/lib/hsm/` | fanotify listener with per-placeholder inode marks, bind-mount views, placeholder xattrs, lease-based eviction helpers |
 | `tether/lib/model/folder_ondemand.go` | Placeholder creation, hydration from peers, eviction, pins, cache budget |
 | `tether/lib/model/model_ondemand.go` | Listener lifecycle, hydration policy, `/rest/ondemand/*` backing |
 | `tether/cmd/tether/` | `tether` CLI (`status`, `pin`, `unpin`, `evict`, `hydrate` by path) |
@@ -38,7 +38,7 @@ Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` fo
 Step-by-step setup is in [docs/setup.md](docs/setup.md). In short:
 
 Requirements for on-demand folders: Linux ≥ 6.14, and `CAP_SYS_ADMIN` for the daemon (fanotify pre-content groups
-and mount marks are privileged). The folder must also be on a filesystem that supports pre-content events:
+are privileged). The folder must also be on a filesystem that supports pre-content events:
 - **What decides it:** tether has no filesystem-specific code. The kernel only allows these events on filesystems that
   opt in: ext4 (which also serves ext2/ext3), xfs and btrfs.
 - **Tested:** ext4, xfs and btrfs pass the kernel-level checks under QEMU on 6.14 and 6.17 (`e2e/vm/run.sh`).
@@ -59,8 +59,9 @@ A client folder is a normal send-receive folder with four extra settings:
 ```
 
 - **`path`** is used by the sync engine.
-- **`onDemandView`** is a bind mount of it that tether creates and marks. Only the view triggers downloads, so only the
-  view should be used.
+- **`onDemandView`** is a bind mount of it that tether creates, and where you work. Every placeholder's inode carries
+  a fanotify mark, so opening it through any path downloads it first: the view, `path`, a container's bind mount or a
+  sandbox (read-only mounts included).
 
 ```sh
 tether status ~/Docs/Photos      # local / pinned / online-only per file
@@ -104,15 +105,18 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
   - **Reconnect in progress:** reads wait for a peer that is still connecting.
 - **Indexers** (tracker, baloo, updatedb/plocate, …) get `EPERM` instead of downloading everything. Extend the list
   with `<hydrationDenyExe>`.
+- **Containers and sandboxes** (docker `-v`, flatpak/bwrap, `unshare -m`) download on open like any other process,
+  because the marks are on the placeholders' inodes, not on a mount. A placeholder that was moved and is then reached
+  through a bind of its directory can't be identified from the path the kernel reports; it fails with `EIO`.
 - **Crash safety:** the view exists only while the listener runs. If the daemon is killed, the monitor process unmounts
-  the view, so placeholders are never readable as zeros.
+  the view, so placeholders are never readable as zeros there. See the limitation below for other paths.
 
 ## Testing
 
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 38 end-to-end tests, ~3.5 min
+sudo e2e/run.sh                          # 39 end-to-end tests, ~4 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
@@ -138,10 +142,12 @@ host's network). Both fail identically on unmodified upstream in this environmen
 
 ## Known limitations
 
-- **Sandboxed processes read online-only files as zeros.** A process in another mount namespace (docker `-v`,
-  flatpak/bwrap, `unshare -m`) gets a copy of the view that carries no fanotify mark. It reads placeholders as zeros
-  and could save them back. The fix, per-placeholder inode marks, is in progress; see
+- **While the daemon is down, placeholders read as zeros outside the view.** Marks live in the kernel only while the
+  daemon runs, and it marks every placeholder again at startup (1.5–2.2 s per million). Until then, `path` and the
+  copies of the view held by containers or sandboxes started earlier read placeholders as zeros. Planned: the monitor
+  keeps the fanotify group across crashes, `chattr +i` on placeholders, and a BPF LSM guard; see
   [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md).
+- **Kernel memory:** a marked inode can't be evicted, so each online-only file holds about 1.3 KB of kernel memory.
 
 - **Directory listings are materialised.** Every client creates a placeholder for every file. That costs inodes, and
   metadata, but no data blocks. Measured cost per placeholder:

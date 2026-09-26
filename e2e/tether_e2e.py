@@ -1038,6 +1038,31 @@ def crash_before_hydration_commit(c):
 
 
 @test
+def other_mount_namespace_hydrates(c):
+    """A process in another mount namespace (a container, flatpak) reads real content, never zeros."""
+    n = c.c1
+    rels = ["ns/copy.bin", "ns/bind.bin", "ns/lower.bin", "ns/ro.bin", "ns/after.bin"]
+    for i, rel in enumerate(rels):
+        FILES[rel] = random.Random(40 + i).randbytes(200 * 1024)
+        c.write_server(rel, FILES[rel])
+    for rel in rels:
+        c.wait_placeholder(n, rel)
+    # The namespace's copy of the view, and a container-style bind of it.
+    copy = n.sh(f"unshare -m sha256sum {VIEW}/ns/copy.bin", check=False)
+    bind = n.sh(f"unshare -m sh -c 'mkdir -p /tmp/cx && mount --bind {VIEW} /tmp/cx && sha256sum /tmp/cx/ns/bind.bin'",
+                check=False)
+    # The folder's real path, which used to bypass the view's mark.
+    lower = n.sh(f"sha256sum {LOWER}/ns/lower.bin", check=False)
+    # A read-only bind (docker -v ...:ro); the listener must keep serving.
+    ro = n.sh(f"unshare -m sh -c 'mkdir -p /tmp/ro && mount --bind {VIEW} /tmp/ro && "
+              f"mount -o remount,bind,ro /tmp/ro && sha256sum /tmp/ro/ns/ro.bin'", check=False)
+    after = n.sh(f"sha256sum {VIEW}/ns/after.bin", check=False)
+    for rel, p in zip(rels, (copy, bind, lower, ro, after)):
+        assert p.returncode == 0 and p.stdout.split()[0] == sha(FILES[rel]), (rel, p.stdout, p.stderr)
+        assert not n.is_placeholder(rel), rel
+
+
+@test
 def no_zero_uploads(c):
     """Global invariant: every file the server has matches what was written; nothing became zeros."""
     for rel, data in FILES.items():

@@ -215,7 +215,7 @@ func (f *sendReceiveFolder) writePlaceholder(file protocol.FileInfo, dbUpdateCha
 			return err
 		}
 		defer osf.Close()
-		return hsm.MarkVirtual(osf, file.Size, file.Name, blocksHashOf(file))
+		return f.model.hsmMakePlaceholder(osf, file)
 	}, tempName)
 	if err != nil {
 		_ = f.mtimefs.Remove(tempName)
@@ -376,6 +376,7 @@ func (f *sendReceiveFolder) hydrateOnce(ctx context.Context, name string, dst *o
 	if err := hsm.Finish(dst, mtime, atime); err != nil {
 		return err
 	}
+	f.model.hsmUnmark(dst)
 
 	// The file is complete and durable, so the application can go on. The
 	// index update is batched: doing it inline costs a database transaction
@@ -636,10 +637,9 @@ func (f *sendReceiveFolder) evict(name string) error {
 		f.ScheduleForceRescan(name)
 		return fmt.Errorf("%s: %w", name, err)
 	}
-	if err := hsm.MarkVirtual(fd, cur.Size, cur.Name, blocksHashOf(cur)); err != nil {
-		return err
+	if err := f.model.hsmMakePlaceholder(fd, cur); err != nil {
+		return fmt.Errorf("%s: %w", name, err)
 	}
-	f.model.hsmForget(fd)
 
 	cur.LocalFlags |= protocol.FlagLocalVirtual
 	cur.Sequence = 0
