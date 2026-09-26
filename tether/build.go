@@ -977,18 +977,50 @@ func getGitVersion() (string, error) {
 	return vcur, nil
 }
 
+// getTetherVersion derives a version for tether builds, whose repository has
+// no Syncthing release tags: the upstream release from the UPSTREAM file plus
+// the commit, e.g. v2.1.5-tether+372d4776 (or ...-dirty).
+func getTetherVersion() (string, error) {
+	bs, err := os.ReadFile("UPSTREAM")
+	if err != nil {
+		return "", err
+	}
+	var base string
+	for _, line := range strings.Split(string(bs), "\n") {
+		if v, ok := strings.CutPrefix(line, "tag:"); ok {
+			base = strings.TrimSpace(v)
+		}
+	}
+	if !strings.HasPrefix(base, "v") {
+		return "", errors.New("no tag in UPSTREAM")
+	}
+	ver := base + "-tether"
+	if bs, err := runError("git", "describe", "--always", "--dirty", "--abbrev=8", "--exclude=*"); err == nil {
+		hash, dirty := strings.CutSuffix(string(bs), "-dirty")
+		ver += "+" + hash
+		if dirty {
+			ver += "-dirty"
+		}
+	}
+	return ver, nil
+}
+
 func getVersion() string {
 	// First try for a RELEASE file or $VERSION env var,
 	if ver, err := getReleaseVersion(); err == nil {
 		return ver
 	}
 	// ... then see if we have a Git tag.
-	if ver, err := getGitVersion(); err == nil {
+	if ver, err := getGitVersion(); err == nil && strings.HasPrefix(ver, "v") {
 		if strings.Contains(ver, "-") {
 			// The version already contains a hash and stuff. See if we can
 			// find a current branch name to tack onto it as well.
 			return ver + getBranchSuffix()
 		}
+		return ver
+	}
+	// ... then a tether build without release tags.
+	if ver, err := getTetherVersion(); err == nil {
 		return ver
 	}
 	// This seems to be a dev build.

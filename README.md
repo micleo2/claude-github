@@ -11,8 +11,13 @@ This works through **fanotify pre-content events** (Linux ≥ 6.14). When a prog
 blocks it while tether fetches the content from a peer, verifies every block and writes it in place. After that the
 program reads a normal local file at native speed.
 
-- Design and rationale: [PLAN.md](PLAN.md)
-- Kernel-level findings (Phase 0): [spikes/fanotify-hsm/FINDINGS.md](spikes/fanotify-hsm/FINDINGS.md)
+- **Setting up a server and clients:** [docs/setup.md](docs/setup.md)
+- **Design and rationale:** [PLAN.md](PLAN.md)
+- **Kernel-level findings (Phase 0):** [spikes/fanotify-hsm/FINDINGS.md](spikes/fanotify-hsm/FINDINGS.md)
+- **Small-file performance survey:** [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md)
+- **Next step, crawler-aware prefetch:** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
+
+Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` for the CLI).
 
 ## Layout
 
@@ -27,6 +32,8 @@ program reads a normal local file at native speed.
 | `spikes/fanotify-hsm/` | Phase 0 kernel spike and its conformance matrix |
 
 ## Using it
+
+Step-by-step setup is in [docs/setup.md](docs/setup.md). In short:
 
 Requirements for on-demand folders: Linux ≥ 6.14, and `CAP_SYS_ADMIN` for the daemon (fanotify pre-content groups
 and mount marks are privileged). The folder must also be on a filesystem that supports pre-content events:
