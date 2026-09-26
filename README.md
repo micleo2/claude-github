@@ -195,5 +195,6 @@ host's network). Both fail identically on unmodified upstream in this environmen
 - **Ignore patterns (`.stignore`)** are not tested with on-demand folders and not supported there.
 - **Privileges.** The daemon runs with `CAP_SYS_ADMIN`. The split into a small privileged helper and an unprivileged
   sync daemon (PLAN.md §4.6) is not implemented yet.
-- **Only ext4 has been exercised end to end.** xfs and btrfs pass the kernel-level checks under QEMU, but the
-  multi-node suite has only run on ext4.
+- **The multi-node suite runs on ext4 only.** btrfs is exercised end to end by the live V8 deployment (the client's
+  `/home`), including the stress runs in docs/research. xfs passes the kernel-level checks under QEMU and the `hsm`
+  tests.
