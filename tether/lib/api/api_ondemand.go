@@ -38,6 +38,22 @@ func (s *service) getOnDemandStatus(w http.ResponseWriter, r *http.Request) {
 	sendJSON(w, files)
 }
 
+func (s *service) getOnDemandWalkers(w http.ResponseWriter, r *http.Request) {
+	od, ok := s.onDemander(w)
+	if !ok {
+		return
+	}
+	walkers, err := od.OnDemandWalkers(r.URL.Query().Get("folder"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	if walkers == nil {
+		walkers = []model.OnDemandWalker{}
+	}
+	sendJSON(w, walkers)
+}
+
 func (s *service) postOnDemand(w http.ResponseWriter, r *http.Request) {
 	od, ok := s.onDemander(w)
 	if !ok {

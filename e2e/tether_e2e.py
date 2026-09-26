@@ -1154,6 +1154,8 @@ def crawl_prefetch_other_walkers(c):
                 # Learned after a few skipped files; before that, one window.
                 assert fetched <= len(others) // 4, f"{fetched} of {len(others)} skipped files fetched"
                 print(f"      grep --include fetched {fetched} of {len(others)} files it skips")
+                walkers = n.api("GET", f"/rest/ondemand/walkers?folder={FOLDER}")
+                assert any("ext:.txt" in w["excluded"] for w in walkers if w["root"].startswith(root)), walkers
         print(f"      {label}: off {times['off']:.1f}s, on {times['on']:.1f}s ({times['off'] / times['on']:.1f}x)")
         assert times["on"] * 2 < times["off"], (label, times)
     set_folder(n, crawlPrefetchMaxFileKiB=1024)
@@ -1175,6 +1177,12 @@ def crawl_prefetch_byte_cap(c):
         assert 4 < local <= 8, f"{local} files local"
         for rel in names[:8]:
             assert n.view_sha(rel) == sha(FILES[rel]), rel
+        # Reported, while active or once ended.
+        walkers = n.api("GET", f"/rest/ondemand/walkers?folder={FOLDER}")
+        mine = [w for w in walkers if w["exe"].endswith("/cat") and w["root"].startswith("crawlcap")]
+        assert mine and mine[0]["capped"] and mine[0]["bytes"] <= 1 * MiB, walkers
+        out = n.sh(f"/opt/tether/tether --home /data/home walkers '{VIEW}'").stdout
+        assert "cat" in out and "reached crawlPrefetchMaxMiB" in out, out
     finally:
         set_folder(n, crawlPrefetchMaxMiB=1024)
 

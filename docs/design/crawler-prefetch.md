@@ -71,6 +71,9 @@ An actor is a **walker** when it opens placeholders in at least **4 directories 
   checks that such walks download nothing.
 - **Indexers never qualify:** they are denied before any hydration (the existing deny list).
 - **The root** of the walk is taken to be the deepest directory containing those first directories.
+- **Near the folder root, more evidence.** If those directories have nothing in common below the folder root, the
+  actor must open placeholders in 8 directories, not 4. A mistaken walk of the whole folder costs the most; EdenFS
+  is stricter near the repository root for the same reason.
 
 ## 4. Prediction
 
@@ -100,6 +103,9 @@ An actor is a **walker** when it opens placeholders in at least **4 directories 
 - **Past the root.** When the walk below the root is done, the root widens to its parent and the prediction continues
   after the old root, with the smallest window. The walker's real root is not known (we only see where it started),
   so going on costs at most a few speculative files if it has stopped.
+  - **Never into the whole folder.** Speculation doesn't widen to the folder root; a walker that goes on there shows
+    it by opening a placeholder outside.
+  - **Sweeps never widen** by themselves.
 - **Window.** At most W files are downloaded ahead of the walker and not yet opened by it. W starts at 16, stays
   between 16 and 1024 (a sweep uses 1024), and adapts:
   - **Grows:** doubles whenever the walker opens a predicted file that is still downloading.
@@ -108,6 +114,12 @@ An actor is a **walker** when it opens placeholders in at least **4 directories 
 - **Bytes.** At most 256 MiB, or a tenth of a fixed `cacheBudget` if that is smaller, may be downloaded ahead and not
   yet opened, and at most `crawlPrefetchMaxMiB` (default 1024) per walk in total. Beyond that we stop speculating and
   say so in the log; the walker's own opens are still served.
+- **Eviction feedback.** When the cache budget evicts a file prefetched for a walker that never opened it, that
+  walker's window halves. Its speculation is displacing cached files (AMP shrinks a stream's prefetch degree the same
+  way).
+- **Sweep accuracy, stricter near the root.** A sweep pauses while fewer than 1 in 10 of its files were opened. The
+  pause starts once 1000 are unopened, but 250 when the sweep's root is a top-level directory, and 64 at the folder
+  root.
 
 ## 5. Scheduling
 
@@ -128,7 +140,15 @@ handling):
 - **Notifying the user** over D-Bus when a walker hits its byte cap, like Windows' per-app download notification.
   Today this is a log line.
 - **Deprioritising fetch-heavy actors'** own demand opens below other applications'.
-- **Reporting active walkers** in `tether status` / REST. They are in the debug log for now.
+
+**Reporting.** Active walkers, and the last 16 that ended, are reported by `tether walkers [PATH]` and
+`GET /rest/ondemand/walkers?folder=`. Each entry gives:
+- program, process group and root
+- order
+- files opened, prefetched and evicted unopened
+- bytes
+- whether it reached its cap
+- the extensions and directory names it was learned to skip
 
 ## Tests
 

@@ -1328,6 +1328,9 @@ func (f *sendReceiveFolder) enforceCacheBudget() error {
 		}
 		if batch.n > before {
 			used -= c.size
+			if c.atime.Unix() <= 1 { // prefetched, never opened
+				f.crawlEvictedUnused(c.name)
+			}
 		}
 	}
 	if err := batch.flush(); err != nil {

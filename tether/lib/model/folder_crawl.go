@@ -42,8 +42,12 @@ const (
 	// A process group becomes a walker when it opens placeholders in this
 	// many directories within crawlDetectWindow. Only placeholders count:
 	// find, du and ls -R never open file content, and never qualify.
-	crawlDetectDirs   = 4
-	crawlDetectWindow = 2 * time.Second
+	crawlDetectDirs = 4
+	// ... or this many when they have nothing in common below the folder
+	// root: a walk of the whole folder costs the most if we are wrong
+	// (EdenFS is stricter near the repository root too).
+	crawlDetectDirsAtRoot = 8
+	crawlDetectWindow     = 2 * time.Second
 	// Walkers are forgotten once their process group is gone, or after
 	// this long without opening anything we prefetched or predicted.
 	crawlIdle = 30 * time.Second
@@ -64,7 +68,7 @@ const (
 	// crawlSweepMinUse of the files fetched this far were opened, once
 	// crawlSweepLag of them were not.
 	crawlSweepMinUse = 10
-	crawlSweepLag    = 1000
+	crawlSweepLag    = 1000 // below the folder root's children; 250 in one, 64 in the root
 	crawlMaxActors   = 64
 	crawlMaxProduced = 1 << 16
 	// A misprediction is explained by an order if the missed file is
@@ -86,6 +90,30 @@ const (
 type crawlTracker struct {
 	mut    sync.Mutex
 	actors map[int]*crawlActor // by process group
+	ended  []OnDemandWalker    // most recent last, for status
+}
+
+// crawlEndedKept is how many ended walks status reports.
+const crawlEndedKept = 16
+
+// OnDemandWalker describes a tree walk we prefetch for, as reported by the
+// API.
+type OnDemandWalker struct {
+	Exe        string    `json:"exe"`
+	PGID       int       `json:"pgid"`
+	Root       string    `json:"root"`
+	Order      string    `json:"order"` // directory, sorted or sweep
+	Started    time.Time `json:"started"`
+	Ended      time.Time `json:"ended,omitzero"`
+	Opened     int       `json:"opened"`     // prefetched files it opened
+	Waited     int       `json:"waited"`     // ... while still downloading
+	Missed     int       `json:"missed"`     // placeholders it opened that we had not predicted
+	Prefetched int       `json:"prefetched"` // files handed to the prefetcher
+	Bytes      int64     `json:"bytes"`
+	Evicted    int       `json:"evicted"` // prefetched, evicted by the cache budget unopened
+	Window     int       `json:"window"`
+	Capped     bool      `json:"capped"`   // reached crawlPrefetchMaxMiB
+	Excluded   []string  `json:"excluded"` // learned: "ext:.txt", "dir:.git"
 }
 
 type crawlActor struct {
@@ -124,6 +152,7 @@ func (o crawlOrder) String() string {
 // (refilling).
 type crawlLane struct {
 	exe         string
+	started     time.Time
 	root        string // the walk is below this directory
 	restart     string // reposition the walk after this file
 	refilling   bool
@@ -152,6 +181,7 @@ type crawlLane struct {
 	opened   int // prefetched files the walker opened
 	waited   int // ... while we were still fetching them
 	missed   int // placeholders it opened that we had not predicted
+	evicted  int // prefetched for it, evicted by the cache budget unopened
 }
 
 type aheadFile struct {
@@ -193,6 +223,7 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) (served f
 			a.parallel = true
 			if a.lane != nil && a.lane.order != orderSweep {
 				a.lane.order = orderSweep
+				a.lane.window = crawlWindowMax
 				a.lane.rewalk = true
 				clear(a.lane.skipped)
 			}
@@ -222,12 +253,13 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) (served f
 			dirs[tc.dir] = struct{}{}
 			root = commonDir(root, tc.dir)
 		}
-		if len(dirs) < crawlDetectDirs {
+		if len(dirs) < crawlDetectDirs || root == "" && len(dirs) < crawlDetectDirsAtRoot {
 			return
 		}
 		exe, _ := os.Readlink(fmt.Sprintf("/proc/%d/exe", pid))
 		l = &crawlLane{
 			exe:      exe,
+			started:  now,
 			root:     root,
 			restart:  name,
 			last:     name,
@@ -239,6 +271,7 @@ func (f *sendReceiveFolder) crawlTouch(pid int, name string, hit bool) (served f
 		}
 		if a.parallel {
 			l.order = orderSweep
+			l.window = crawlWindowMax
 			l.rewalk = true
 		}
 		a.lane = l
@@ -333,8 +366,8 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 		}
 		need := l.window - len(l.ahead)
 		if l.order == orderSweep {
-			need = crawlWindowMax - len(l.ahead)
-			if n := len(l.produced); n-l.opened > crawlSweepLag && l.opened*crawlSweepMinUse < n {
+			need = l.window - len(l.ahead)
+			if n := len(l.produced); n-l.opened > sweepLag(l.root) && l.opened*crawlSweepMinUse < n {
 				need = 0
 			}
 		}
@@ -378,6 +411,7 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 			// after comparing the work tree) keeps its order.
 			if l.order != orderSweep && l.unexplained >= crawlUnexplainedMax && l.unexplained*crawlUnexplainedShare >= l.opened {
 				order = orderSweep
+				l.window = crawlWindowMax
 				f.sl.Debug("Tree walk has no order we can follow; covering its subtree", "exe", l.exe, "pgid", a.id)
 			}
 			l.last = last
@@ -473,7 +507,9 @@ func (f *sendReceiveFolder) crawlRefill(a *crawlActor, l *crawlLane) {
 		if done {
 			// A sweep says nothing about where the walker goes next; it
 			// widens only when the walker opens a file outside it.
-			if l.order != orderSweep && l.root != "" && l.root == l.walkRoot && l.restart == "" {
+			// Nor does it speculate into the whole folder: a walker that
+			// goes on there shows it by opening a placeholder outside.
+			if l.order != orderSweep && strings.Contains(l.root, "/") && l.root == l.walkRoot && l.restart == "" {
 				// The directory we took for the walk's root is done, but
 				// the walker may well go on (we only saw where it began).
 				// Continue after it in its parent, with a small window
@@ -547,6 +583,76 @@ func explains(base, root, after, name string, o crawlOrder) bool {
 	return false
 }
 
+// describe reports the lane of actor id.
+func (l *crawlLane) describe(id int) OnDemandWalker {
+	w := OnDemandWalker{
+		Exe: l.exe, PGID: id, Root: l.root, Order: l.order.String(), Started: l.started,
+		Opened: l.opened, Waited: l.waited, Missed: l.missed, Prefetched: l.seq, Bytes: l.total,
+		Evicted: l.evicted, Window: l.window, Capped: l.capped, Excluded: []string{},
+	}
+	for k, n := range l.skipped {
+		if n >= crawlExcludeAfter && l.used[k] == 0 {
+			w.Excluded = append(w.Excluded, k)
+		}
+	}
+	slices.Sort(w.Excluded)
+	return w
+}
+
+// crawlWalkers reports the active walks, then recently ended ones.
+func (f *sendReceiveFolder) crawlWalkers() []OnDemandWalker {
+	t := &f.od.crawl
+	t.mut.Lock()
+	defer t.mut.Unlock()
+	var out []OnDemandWalker
+	for id, a := range t.actors {
+		if a.lane != nil {
+			out = append(out, a.lane.describe(id))
+		}
+	}
+	slices.SortFunc(out, func(a, b OnDemandWalker) int { return a.Started.Compare(b.Started) })
+	for i := len(t.ended) - 1; i >= 0; i-- {
+		out = append(out, t.ended[i])
+	}
+	return out
+}
+
+// sweepLag is how many swept files may go unopened before the sweep pauses
+// for too few of them being used.
+func sweepLag(root string) int {
+	switch strings.Count(root, "/") {
+	case 0:
+		if root == "" {
+			return 64
+		}
+		return 250
+	default:
+		return crawlSweepLag
+	}
+}
+
+// crawlEvictedUnused is told that the cache budget evicted name, which was
+// prefetched and never opened. A walker it was fetched for gets a smaller
+// window: its speculation displaces cached files (AMP shrinks a stream's
+// prefetch degree the same way).
+func (f *sendReceiveFolder) crawlEvictedUnused(name string) {
+	t := &f.od.crawl
+	t.mut.Lock()
+	defer t.mut.Unlock()
+	for _, a := range t.actors {
+		l := a.lane
+		if l == nil {
+			continue
+		}
+		if af, ok := l.ahead[name]; ok {
+			delete(l.ahead, name)
+			l.pending -= af.size
+			l.window = max(l.window/2, crawlWindowMin)
+			l.evicted++
+		}
+	}
+}
+
 // crawlExpects reports whether a walker has yet to open name, which we
 // prefetched for it.
 func (f *sendReceiveFolder) crawlExpects(name string) bool {
@@ -602,7 +708,13 @@ func (f *sendReceiveFolder) crawlJanitor(ctx context.Context) {
 				unused = append(unused, name)
 			}
 			unused = append(unused, l.unused...)
-			f.sl.Debug("Tree walk ended", "exe", l.exe, "pgid", a.id, "opened", l.opened, "waited", l.waited, "missed", l.missed, "prefetched", len(l.produced), "bytes", l.total, "window", l.window)
+			w := l.describe(a.id)
+			w.Ended = time.Now()
+			t.ended = append(t.ended, w)
+			if len(t.ended) > crawlEndedKept {
+				t.ended = t.ended[1:]
+			}
+			f.sl.Debug("Tree walk ended", "exe", l.exe, "pgid", a.id, "opened", l.opened, "waited", l.waited, "missed", l.missed, "evicted", l.evicted, "prefetched", len(l.produced), "bytes", l.total, "window", l.window)
 		}
 		t.mut.Unlock()
 		for _, a := range dropped {

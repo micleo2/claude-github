@@ -242,3 +242,9 @@ func TestPrefetchQueueFilterLane(t *testing.T) {
 		t.Fatal("a dropped file stays marked as queued")
 	}
 }
+
+func TestSweepLagIsStricterNearTheRoot(t *testing.T) {
+	if !(sweepLag("") < sweepLag("a") && sweepLag("a") < sweepLag("a/b") && sweepLag("a/b") == sweepLag("a/b/c")) {
+		t.Fatal(sweepLag(""), sweepLag("a"), sweepLag("a/b"), sweepLag("a/b/c"))
+	}
+}

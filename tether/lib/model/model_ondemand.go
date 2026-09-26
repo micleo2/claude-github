@@ -47,6 +47,7 @@ type OnDemander interface {
 	OnDemandUnpin(folder, path string) error
 	OnDemandEvict(folder, path string, verify bool) (int, error)
 	OnDemandHydrate(ctx context.Context, folder, path string) (int, error)
+	OnDemandWalkers(folder string) ([]OnDemandWalker, error)
 }
 
 var _ OnDemander = (*model)(nil)
@@ -345,6 +346,16 @@ func (m *model) OnDemandStatus(folder, prefix string) ([]OnDemandFileState, erro
 		return nil, err
 	}
 	return sr.onDemandStatus(prefix)
+}
+
+// OnDemandWalkers reports the tree walks being prefetched for in folder,
+// then recently ended ones.
+func (m *model) OnDemandWalkers(folder string) ([]OnDemandWalker, error) {
+	sr, err := m.onDemandFolder(folder)
+	if err != nil {
+		return nil, err
+	}
+	return sr.crawlWalkers(), nil
 }
 
 func pinPattern(path string) string {

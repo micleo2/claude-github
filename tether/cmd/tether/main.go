@@ -12,6 +12,8 @@
 //	tether evict PATH      free the local copy of PATH now (it stays available online;
 //	                       -verify re-reads it first)
 //	tether hydrate PATH    download PATH now without pinning it
+//	tether walkers [PATH]  tree walks (grep -r, builds, ...) being prefetched for,
+//	                       and recent ones
 //
 // PATH may be inside a folder's on-demand view or its real path. The daemon
 // is found through its config.xml (--home, $STHOMEDIR or the default
@@ -48,6 +50,20 @@ type folder struct {
 	OnDemandView string `json:"onDemandView"`
 }
 
+type walker struct {
+	Exe        string    `json:"exe"`
+	PGID       int       `json:"pgid"`
+	Root       string    `json:"root"`
+	Order      string    `json:"order"`
+	Ended      time.Time `json:"ended"`
+	Opened     int       `json:"opened"`
+	Prefetched int       `json:"prefetched"`
+	Bytes      int64     `json:"bytes"`
+	Evicted    int       `json:"evicted"`
+	Capped     bool      `json:"capped"`
+	Excluded   []string  `json:"excluded"`
+}
+
 type fileState struct {
 	Name   string `json:"name"`
 	Size   int64  `json:"size"`
@@ -61,7 +77,7 @@ func main() {
 	apikey := flag.String("apikey", os.Getenv("TETHER_APIKEY"), "API key")
 	verify := flag.Bool("verify", false, "evict: re-read and check every block first (default: size and modification time, as the scanner)")
 	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "usage: tether [flags] status|pin|unpin|evict|hydrate [PATH]\n\nflags:\n")
+		fmt.Fprintf(os.Stderr, "usage: tether [flags] status|pin|unpin|evict|hydrate|walkers [PATH]\n\nflags:\n")
 		flag.PrintDefaults()
 	}
 	flag.Parse()
@@ -110,6 +126,40 @@ func run(c *client, cmd, arg string, verify bool) error {
 		tw.Flush()
 		fmt.Printf("\n%d files, %s local, %s online-only\n", len(files), humanSize(local), humanSize(online))
 		return nil
+	case "walkers":
+		var walkers []walker
+		if err := c.do(http.MethodGet, "/rest/ondemand/walkers?"+q.Encode(), &walkers); err != nil {
+			return err
+		}
+		if len(walkers) == 0 {
+			fmt.Println("no tree walks seen")
+			return nil
+		}
+		tw := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
+		fmt.Fprintln(tw, "STATE\tPROGRAM\tPGID\tUNDER\tORDER\tOPENED\tPREFETCHED\tNOTES")
+		for _, w := range walkers {
+			state := "active"
+			if !w.Ended.IsZero() {
+				state = "ended " + time.Since(w.Ended).Round(time.Second).String() + " ago"
+			}
+			var notes []string
+			if w.Capped {
+				notes = append(notes, "reached crawlPrefetchMaxMiB")
+			}
+			if w.Evicted > 0 {
+				notes = append(notes, fmt.Sprintf("%d evicted unopened", w.Evicted))
+			}
+			if len(w.Excluded) > 0 {
+				notes = append(notes, "skips "+strings.Join(w.Excluded, ","))
+			}
+			root := w.Root
+			if root == "" {
+				root = "."
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\t%d\t%d (%s)\t%s\n", state, filepath.Base(w.Exe), w.PGID, root,
+				w.Order, w.Opened, w.Prefetched, humanSize(w.Bytes), strings.Join(notes, "; "))
+		}
+		return tw.Flush()
 	case "pin", "unpin", "evict", "hydrate":
 		q.Set("path", rel)
 		if cmd == "evict" && verify {

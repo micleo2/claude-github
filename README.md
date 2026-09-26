@@ -35,7 +35,7 @@ Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` fo
 | `tether/lib/model/folder_ondemand.go` | Placeholder creation, hydration from peers, eviction, pins, cache budget |
 | `tether/lib/model/folder_prefetch.go`, `folder_crawl.go` | Sibling prefetch; prefetch ahead of tree walks |
 | `tether/lib/model/model_ondemand.go` | Listener lifecycle, hydration policy, `/rest/ondemand/*` backing |
-| `tether/cmd/tether/` | `tether` CLI (`status`, `pin`, `unpin`, `evict`, `hydrate` by path) |
+| `tether/cmd/tether/` | `tether` CLI (`status`, `pin`, `unpin`, `evict`, `hydrate` by path; `walkers`) |
 | `e2e/` | Multi-node Docker end-to-end suite |
 | `spikes/fanotify-hsm/` | Phase 0 kernel spike and its conformance matrix |
 
@@ -75,9 +75,10 @@ tether pin ~/Docs/Photos/2026    # download now and keep local
 tether unpin ~/Docs/Photos/2026
 tether evict ~/Docs/Videos       # free space; files stay listed and openable (-verify re-reads them first)
 tether hydrate ~/Docs/Report.pdf # download now without pinning
+tether walkers ~/Docs            # tree walks (grep -r, builds, ...) being prefetched for, and recent ones
 ```
 
-The same operations are available over REST under `/rest/ondemand/{status,pin,unpin,evict,hydrate}?folder=&path=`.
+The same operations are available over REST under `/rest/ondemand/{status,pin,unpin,evict,hydrate}?folder=&path=`, and `GET /rest/ondemand/walkers?folder=`.
 
 ## How it behaves
 
@@ -116,6 +117,9 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
     ahead, at most 256 MiB (or a tenth of the cache budget) downloaded and not yet opened, `crawlPrefetchMaxMiB`
     (default 1024) per walk. A sweep pauses while fewer than 1 in 10 fetched files are used.
   - **Never triggered by** `find`, `du`, `ls -R` or indexers, which don't open file content or are denied.
+  - **More evidence near the folder root:** 8 directories instead of 4. Speculation never widens into the whole
+    folder. A walker whose prefetched files the cache budget evicts unopened gets a smaller window.
+  - **Visible:** `tether walkers` lists active and recent walks, what they cost and what they were learned to skip.
   - **Effect** over 600 directories with one file each, 20 ms RTT:
     - `grep -r`: 17.4 s → 1.1 s
     - `rg`: 7.7 s → 1.1 s
@@ -146,7 +150,7 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 ```sh
 sudo spikes/fanotify-hsm/run-tests.sh   # kernel conformance: 28 access paths
 cd tether && go test ./lib/hsm/          # listener unit tests (root)
-sudo e2e/run.sh                          # 50 end-to-end tests, ~9 min
+sudo e2e/run.sh                          # 51 end-to-end tests, ~10 min
 sudo e2e/run.sh --slow                   # bigger trees / files
 ```
 
