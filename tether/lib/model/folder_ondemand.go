@@ -27,6 +27,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,6 +44,10 @@ import (
 const (
 	onDemandMaintenanceInterval = time.Minute
 	hydrationConcurrency        = 4
+	// Right after start, connections to peers are still being set up. A
+	// hydration without any source waits for one during this period
+	// instead of failing at once.
+	hydrationStartupGrace = 30 * time.Second
 )
 
 var (
@@ -55,6 +60,9 @@ var (
 
 // onDemandState is the per-folder bookkeeping for on-demand files.
 type onDemandState struct {
+	maintenancePending atomic.Bool
+	started            time.Time
+
 	mut       sync.Mutex
 	hydrating map[string]struct{}
 	pinKey    string
@@ -63,7 +71,7 @@ type onDemandState struct {
 }
 
 func newOnDemandState() *onDemandState {
-	return &onDemandState{hydrating: make(map[string]struct{})}
+	return &onDemandState{hydrating: make(map[string]struct{}), started: time.Now()}
 }
 
 // FileState is the on-demand state of a single file, as reported by the API.
@@ -294,6 +302,9 @@ func (f *sendReceiveFolder) hydrate(ctx context.Context, name string, dst *os.Fi
 		}
 	}
 	slog.Info("Hydrated file", f.LogAttr(), slogutil.FilePath(name), "size", src.Size, "duration", time.Since(started).Round(time.Millisecond))
+	if f.liveConfig().CacheBudget.Value > 0 {
+		f.scheduleOnDemandMaintenance()
+	}
 	f.evLogger.Log(events.ItemFinished, map[string]any{
 		"folder": f.folderID,
 		"item":   name,
@@ -366,38 +377,60 @@ feed:
 }
 
 func (f *sendReceiveFolder) fetchBlock(ctx context.Context, name string, src protocol.FileInfo, block protocol.BlockInfo, dst *os.File) error {
-	candidates := f.blockSources(name, src, block)
+	timeout := time.Duration(f.liveConfig().HydrationTimeoutS) * time.Second
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	deadline := time.Now().Add(timeout)
+	blockNo := int(block.Offset / int64(src.BlockSize()))
 	var lastErr error = errNoDevice
-	for len(candidates) > 0 {
-		avs := make([]Availability, len(candidates))
-		for i, c := range candidates {
-			avs[i] = c.Availability
-		}
-		i := activity.leastBusy(avs)
-		if i < 0 {
-			break
-		}
-		sel := candidates[i]
-		candidates = slices.Delete(candidates, i, i+1)
+	for {
+		candidates := f.blockSources(name, src, block)
+		for len(candidates) > 0 {
+			avs := make([]Availability, len(candidates))
+			for i, c := range candidates {
+				avs[i] = c.Availability
+			}
+			i := activity.leastBusy(avs)
+			if i < 0 {
+				break
+			}
+			sel := candidates[i]
+			candidates = slices.Delete(candidates, i, i+1)
 
-		activity.using(sel.Availability)
-		blockNo := int(block.Offset / int64(src.BlockSize()))
-		buf, err := f.model.RequestGlobal(ctx, sel.ID, f.folderID, sel.name, blockNo, block.Offset, block.Size, block.Hash, sel.FromTemporary)
-		activity.done(sel.Availability)
-		if err != nil {
-			lastErr = err
-			continue
-		}
-		if err := f.verifyBuffer(buf, block); err != nil {
-			lastErr = err
-			continue
-		}
-		if _, err := dst.WriteAt(buf, block.Offset); err != nil {
+			activity.using(sel.Availability)
+			// A peer that silently went away must not leave the
+			// application blocked until the connection times out.
+			rctx, cancel := context.WithTimeout(ctx, time.Until(deadline))
+			buf, err := f.model.RequestGlobal(rctx, sel.ID, f.folderID, sel.name, blockNo, block.Offset, block.Size, block.Hash, sel.FromTemporary)
+			cancel()
+			activity.done(sel.Availability)
+			if err == nil {
+				err = f.verifyBuffer(buf, block)
+			}
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			_, err = dst.WriteAt(buf, block.Offset)
 			return err
 		}
-		return nil
+
+		// Nobody could serve the block. Wait if a source is about to become
+		// usable: right after start before any connection exists, or while
+		// a device holding the file is connected but still exchanging
+		// cluster config. Otherwise fail now rather than keep the
+		// application waiting.
+		starting := time.Since(f.od.started) < hydrationStartupGrace && !f.model.anyConnected()
+		if !starting && !f.model.sourceConnecting(f.folderID, src.Name, name) || time.Now().After(deadline) {
+			return fmt.Errorf("fetching %s at offset %d: %w", name, block.Offset, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
 	}
-	return fmt.Errorf("fetching %s at offset %d: %w", name, block.Offset, lastErr)
 }
 
 // hydrateName hydrates a placeholder through the folder path (used for pins
@@ -609,8 +642,12 @@ func (f *sendReceiveFolder) onDemandLoop(ctx context.Context) {
 }
 
 func (f *sendReceiveFolder) scheduleOnDemandMaintenance() {
+	if !f.od.maintenancePending.CompareAndSwap(false, true) {
+		return // already queued
+	}
 	go func() {
 		_ = f.doInSync(func(ctx context.Context) error {
+			f.od.maintenancePending.Store(false)
 			if err := f.getHealthErrorWithoutIgnores(); err != nil {
 				return nil
 			}

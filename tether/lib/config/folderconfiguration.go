@@ -98,6 +98,7 @@ type FolderConfiguration struct {
 	PinPatterns       []string `json:"pinPatterns" xml:"pinPattern" restart:"false"`
 	CacheBudget       Size     `json:"cacheBudget" xml:"cacheBudget" default:"0" restart:"false"`
 	HydrationDenyExes []string `json:"hydrationDenyExes" xml:"hydrationDenyExe" restart:"false"`
+	HydrationTimeoutS int      `json:"hydrationTimeoutS" xml:"hydrationTimeoutS" default:"60" restart:"false"`
 
 	// Legacy deprecated
 	DeprecatedReadOnly       bool    `json:"-" xml:"ro,attr,omitempty"`        // Deprecated: Do not use.

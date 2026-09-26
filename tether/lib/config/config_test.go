@@ -128,6 +128,7 @@ func TestDefaultValues(t *testing.T) {
 				BlockIndexing:     true,
 				PinPatterns:       []string{},
 				HydrationDenyExes: []string{},
+				HydrationTimeoutS: 60,
 			},
 			Device: DeviceConfiguration{
 				Addresses:       []string{"dynamic"},
@@ -209,6 +210,7 @@ func TestDeviceConfig(t *testing.T) {
 				BlockIndexing:     true,
 				PinPatterns:       []string{},
 				HydrationDenyExes: []string{},
+				HydrationTimeoutS: 60,
 			},
 		}
 

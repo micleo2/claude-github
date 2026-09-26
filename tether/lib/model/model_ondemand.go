@@ -163,6 +163,32 @@ func (m *model) writeViewsFileLocked() {
 	}
 }
 
+// sourceConnecting reports whether a device that has any of the named
+// files is connected but not yet usable as a source for the folder.
+func (m *model) sourceConnecting(folder string, names ...string) bool {
+	for _, name := range names {
+		devs, err := m.sdb.GetGlobalAvailability(folder, name)
+		if err != nil {
+			continue
+		}
+		m.mut.RLock()
+		for _, dev := range devs {
+			if _, ok := m.deviceConnIDs[dev]; ok && m.remoteFolderStates[dev][folder] != remoteFolderValid {
+				m.mut.RUnlock()
+				return true
+			}
+		}
+		m.mut.RUnlock()
+	}
+	return false
+}
+
+func (m *model) anyConnected() bool {
+	m.mut.RLock()
+	defer m.mut.RUnlock()
+	return len(m.connections) > 0
+}
+
 func (m *model) onDemandFolder(folder string) (*sendReceiveFolder, error) {
 	runner, ok := m.folderRunners.Get(folder)
 	if !ok {
