@@ -15,6 +15,8 @@ program reads a normal local file at native speed.
 - **Design and rationale:** [PLAN.md](PLAN.md)
 - **Kernel-level findings (Phase 0):** [spikes/fanotify-hsm/FINDINGS.md](spikes/fanotify-hsm/FINDINGS.md)
 - **Small-file performance survey:** [docs/research/small-file-hydration.md](docs/research/small-file-hydration.md)
+- **Placeholders seen from other mount namespaces (survey, spikes, options):**
+  [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md)
 - **Next step, crawler-aware prefetch:** [docs/design/crawler-prefetch.md](docs/design/crawler-prefetch.md)
 
 Build with `cd tether && go run build.go build` (plus `go build ./cmd/tether` for the CLI).
@@ -135,6 +137,11 @@ Syncthing's own test suites pass, except `TestHostCheck` (needs IPv6 loopback) a
 host's network). Both fail identically on unmodified upstream in this environment.
 
 ## Known limitations
+
+- **Sandboxed processes read online-only files as zeros.** A process in another mount namespace (docker `-v`,
+  flatpak/bwrap, `unshare -m`) gets a copy of the view that carries no fanotify mark. It reads placeholders as zeros
+  and could save them back. The fix, per-placeholder inode marks, is in progress; see
+  [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md).
 
 - **Directory listings are materialised.** Every client creates a placeholder for every file. That costs inodes, and
   metadata, but no data blocks. Measured cost per placeholder:
