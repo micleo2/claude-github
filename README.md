@@ -28,9 +28,14 @@ program reads a normal local file at native speed.
 
 ## Using it
 
-Requirements for on-demand folders: Linux ≥ 6.14, the folder on **ext4, xfs or btrfs**, and `CAP_SYS_ADMIN` for the
-daemon (fanotify pre-content groups and mount marks are privileged). If these are missing, the folder refuses to start
-and reports an error. It never degrades to placeholders that nothing can fill. The server needs none of this: it holds
+Requirements for on-demand folders: Linux ≥ 6.14, and `CAP_SYS_ADMIN` for the daemon (fanotify pre-content groups
+and mount marks are privileged). The folder must also be on a filesystem that supports pre-content events:
+- **What decides it:** tether has no filesystem-specific code. The kernel only allows these events on filesystems that
+  opt in: ext4 (which also serves ext2/ext3), xfs and btrfs.
+- **Tested:** ext4 and ext2 work. tmpfs, ramfs and overlayfs refuse with `EOPNOTSUPP`. xfs and btrfs were not
+  available to test.
+
+If any requirement is missing, the folder refuses to start and reports an error. It never degrades to placeholders that nothing can fill. The server needs none of this: it holds
 plain files.
 
 A client folder is a normal send-receive folder with four extra settings:
