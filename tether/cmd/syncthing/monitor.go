@@ -17,6 +17,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -25,6 +26,7 @@ import (
 	"github.com/syncthing/syncthing/internal/slogutil"
 	"github.com/syncthing/syncthing/lib/build"
 	"github.com/syncthing/syncthing/lib/fs"
+	"github.com/syncthing/syncthing/lib/hsm"
 	"github.com/syncthing/syncthing/lib/locations"
 	"github.com/syncthing/syncthing/lib/osutil"
 	"github.com/syncthing/syncthing/lib/svcutil"
@@ -98,13 +100,21 @@ func (c *serveCmd) monitorMain() {
 	signal.Notify(restartSign, sigHup)
 
 	childEnv := childEnv()
+	// The fanotify group outlives each sync process, so that on-demand
+	// placeholders stay guarded while one restarts (nil if unavailable).
+	group := onDemandGroup()
+	exitMonitor := func(code int) {
+		// The group closes with us: nothing guards placeholders any more.
+		unmountStaleOnDemandViews()
+		os.Exit(code)
+	}
 	first := true
 	for {
 		maybeReportPanics()
 
 		if t := time.Since(restarts[0]); t < restartLoopThreshold {
 			slog.Error("Too many restarts; not retrying further", slog.Int("count", restartCounts), slog.Any("interval", t))
-			os.Exit(svcutil.ExitError.AsInt())
+			exitMonitor(svcutil.ExitError.AsInt())
 		}
 
 		copy(restarts[0:], restarts[1:])
@@ -112,6 +122,10 @@ func (c *serveCmd) monitorMain() {
 
 		cmd := exec.Command(binary, args[1:]...)
 		cmd.Env = childEnv
+		if group != nil {
+			cmd.ExtraFiles = []*os.File{group}
+			cmd.Env = append(slices.Clone(childEnv), hsm.GroupEnv+"=3")
+		}
 
 		stderr, err := cmd.StderrPipe()
 		if err != nil {
@@ -163,13 +177,16 @@ func (c *serveCmd) monitorMain() {
 		case err = <-exit:
 		}
 
-		// If the child died without cleaning up, its on-demand views are
-		// still mounted but nothing hydrates them anymore.
-		unmountStaleOnDemandViews()
+		// Without a shared group, a child that died without cleaning up
+		// left views that nothing guards anymore. With one, its marks are
+		// intact and accesses wait for the next child, which remounts them.
+		if group == nil {
+			unmountStaleOnDemandViews()
+		}
 
 		if err == nil {
 			// Successful exit indicates an intentional shutdown
-			os.Exit(svcutil.ExitSuccess.AsInt())
+			exitMonitor(svcutil.ExitSuccess.AsInt())
 		}
 
 		exiterr := &exec.ExitError{}
@@ -177,7 +194,7 @@ func (c *serveCmd) monitorMain() {
 			exitCode := exiterr.ExitCode()
 			switch {
 			case stopped || c.NoRestart:
-				os.Exit(exitCode)
+				exitMonitor(exitCode)
 
 			case exitCode == svcutil.ExitUpgrade.AsInt():
 				// Restart the monitor process to release the .old
@@ -186,16 +203,16 @@ func (c *serveCmd) monitorMain() {
 				if err = restartMonitor(binary, args); err != nil {
 					slog.Error("Failed to restart monitor", slogutil.Error(err))
 				}
-				os.Exit(exitCode)
+				exitMonitor(exitCode)
 
 			case exitCode == svcutil.ExitNoRestart.AsInt():
 				// Requested to not restart the child
-				os.Exit(exitCode)
+				exitMonitor(exitCode)
 			}
 		}
 
 		if c.NoRestart {
-			os.Exit(svcutil.ExitError.AsInt())
+			exitMonitor(svcutil.ExitError.AsInt())
 		}
 
 		slog.Info("Syncthing exited", slogutil.Error(err))

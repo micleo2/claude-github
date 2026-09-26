@@ -108,8 +108,10 @@ The same operations are available over REST under `/rest/ondemand/{status,pin,un
 - **Containers and sandboxes** (docker `-v`, flatpak/bwrap, `unshare -m`) download on open like any other process,
   because the marks are on the placeholders' inodes, not on a mount. A placeholder that was moved and is then reached
   through a bind of its directory can't be identified from the path the kernel reports; it fails with `EIO`.
-- **Crash safety:** the view exists only while the listener runs. If the daemon is killed, the monitor process unmounts
-  it, so newly opened paths no longer lead to placeholders. The unmount is lazy, though: see the limitation below.
+- **Crash safety:** the monitor process (`syncthing serve`) owns the fanotify group and hands it to every sync process
+  it starts, so the marks survive a crash of the sync process. Accesses meanwhile wait for the restarted process
+  (about 1–2 s). Downloads in flight at the crash fail with `EIO`. In a `kill -9` during 16 parallel readers of V8,
+  16 reads failed and none read zeros (before: 11,200 zero-filled reads).
 
 ## Testing
 
@@ -142,12 +144,11 @@ host's network). Both fail identically on unmodified upstream in this environmen
 
 ## Known limitations
 
-- **While the daemon is down, placeholders read as zeros.** Marks live in the kernel only while the daemon runs, and it
-  marks every placeholder again at startup (1.5–2.2 s per million). Until then placeholders read as zeros through
-  `path`, through copies of the view held by containers or sandboxes, and from any process whose working directory is
-  inside the view (the lazy unmount leaves it reachable). A `kill -9` during parallel reads of V8 produced 11,200
-  zero-filled reads. Planned: the monitor
-  keeps the fanotify group across crashes, `chattr +i` on placeholders, and a BPF LSM guard; see
+- **While tether is stopped, placeholders read as zeros.** Stopping the service, a crash of the monitor process, or a
+  reboot closes the fanotify group, and the marks go with it (they are re-added at startup, 1.5–2.2 s per million).
+  Until then placeholders read as zeros through `path`, through copies of the view held by containers or sandboxes,
+  and from any process whose working directory was inside the view (the view's unmount is lazy). Planned: `chattr +i` on
+  placeholders, and a BPF LSM guard; see
   [docs/research/placeholder-access-paths.md](docs/research/placeholder-access-paths.md).
 - **Kernel memory:** a marked inode can't be evicted, so each online-only file holds about 1.3 KB of kernel memory.
 

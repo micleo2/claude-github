@@ -992,24 +992,41 @@ def silent_network_loss_times_out(c):
 
 
 @test
-def crash_unmounts_view_and_recovers(c):
-    """kill -9 of the sync process: the monitor removes the unmarked view; after restart all works."""
+def crash_keeps_placeholders_guarded(c):
+    """kill -9 of the sync process while a shell in the view reads placeholders: reads wait or fail, never zeros."""
     n = c.c1
-    rel = "after-crash.bin"
-    FILES[rel] = random.Random(10).randbytes(1 * MiB)
-    c.write_server(rel, FILES[rel])
-    c.wait_placeholder(n, rel)
+    names = [f"crash/f{i:03}.bin" for i in range(60)]
+    for i, rel in enumerate(names):
+        # Above prefetchMaxFileKiB, so each one is still a placeholder when read.
+        FILES[rel] = random.Random(1000 + i).randbytes(300 * 1024)
+        c.write_server(rel, FILES[rel])
+    for rel in names:
+        c.wait_placeholder(n, rel)
+    n.sh("rm -f /tmp/cr.out /tmp/cr.done")
+    # The reader's working directory is inside the view, which a lazy unmount
+    # would leave reachable.
+    n.sh(f"cd {VIEW}/crash && (for f in *.bin; do sha256sum $f || echo \"ERR $f\"; sleep 0.05; done "
+         f"> /tmp/cr.out 2>&1; touch /tmp/cr.done) > /dev/null 2>&1 &")
+    time.sleep(0.5)
     procs = run("docker", "top", n.container, "-o", "pid,ppid,args").stdout.splitlines()[1:]
     rows = [p.split(None, 2) for p in procs]
     pids = {r[0] for r in rows if "syncthing" in r[2]}
     child = [r[0] for r in rows if "syncthing" in r[2] and r[1] in pids]
     assert child, procs
     run("kill", "-9", child[0])
-    wait_for(lambda: "Unmounted on-demand view left behind" in n.logs(400), 30, what="monitor cleanup")
-    wait_for(lambda: n.api("GET", "/rest/system/status"), 60, what="restart")
+    wait_for(lambda: n.sh("test -e /tmp/cr.done", check=False).returncode == 0, 120, what="reader finished")
+    out = n.sh("cat /tmp/cr.out").stdout.splitlines()
+    hashes = {line.split()[1]: line.split()[0] for line in out if not line.startswith(("ERR", "sha256sum"))}
+    errors = [line for line in out if line.startswith("ERR")]
+    wrong = [f for f, h in hashes.items() if h != sha(FILES["crash/" + f])]
+    print(f"      {len(hashes)} read, {len(errors)} failed, {len(wrong)} wrong")
+    assert not wrong, f"read wrong content (zeros) after the crash: {wrong[:5]}"
+    assert len(errors) <= 2, f"only a download in flight at the crash may fail: {errors}"
+    assert "Marked placeholders" in n.logs(2000), "the sync process did not restart"
     wait_for(lambda: n.sh(f"grep -q ' {VIEW} ' /proc/self/mountinfo", check=False).returncode == 0, 30,
              what="view remounted")
-    assert n.view_sha(rel) == sha(FILES[rel])
+    for rel in names:
+        assert n.view_sha(rel) == sha(FILES[rel]), rel
 
 
 @test

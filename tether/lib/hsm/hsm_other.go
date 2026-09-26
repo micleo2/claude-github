@@ -25,6 +25,7 @@ const (
 	XattrOrigin     = "user.tether.origin"
 	XattrBlocksHash = "user.tether.bh"
 	XattrPrefix     = "user.tether."
+	GroupEnv        = "TETHER_HSM_GROUP_FD"
 )
 
 type Handler interface {

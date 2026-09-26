@@ -34,6 +34,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -101,7 +102,12 @@ type Listener struct {
 	flights sync.Map // fileKey -> *flight
 
 	closeOnce sync.Once
-	closeErr  error
+	// fdMu keeps responses from being written after Close: the fd number
+	// may by then name another file, or another listener's event.
+	fdMu     sync.RWMutex
+	closed   bool
+	wake     int // eventfd that interrupts Serve's poll on Close
+	closeErr error
 }
 
 type fileKey struct {
@@ -124,21 +130,98 @@ func Supported() error {
 	return nil
 }
 
-func New(handler Handler, policy Policy, log *slog.Logger) (*Listener, error) {
+// GroupEnv names the environment variable through which the monitor
+// process passes the fanotify group (see NewGroup) to the sync process.
+const GroupEnv = "TETHER_HSM_GROUP_FD"
+
+// NewGroup creates the fanotify group. The monitor process creates it and
+// passes it to every sync process it starts, so that the group, and with it
+// every placeholder's mark, outlives a crashed sync process: accesses in the
+// meantime wait in the queue for the next one instead of reading zeros.
+func NewGroup() (int, error) {
 	// Event fds are read-only: a read-write one cannot be opened for an
 	// access through a read-only mount (docker -v ...:ro). FD_ERROR reports
 	// such failures in the event instead of failing read().
-	fd, err := unix.FanotifyInit(unix.FAN_CLASS_PRE_CONTENT|unix.FAN_CLOEXEC|unix.FAN_UNLIMITED_QUEUE|
-		unix.FAN_UNLIMITED_MARKS|unix.FAN_REPORT_FD_ERROR, unix.O_RDONLY|unix.O_LARGEFILE)
+	// Non-blocking, so that a listener being closed never sits in read()
+	// and takes an event that its successor should get (see Serve).
+	fd, err := unix.FanotifyInit(unix.FAN_CLASS_PRE_CONTENT|unix.FAN_CLOEXEC|unix.FAN_NONBLOCK|
+		unix.FAN_UNLIMITED_QUEUE|unix.FAN_UNLIMITED_MARKS|unix.FAN_REPORT_FD_ERROR, unix.O_RDONLY|unix.O_LARGEFILE)
 	if err != nil {
-		return nil, fmt.Errorf("fanotify_init: %w", err)
+		return -1, fmt.Errorf("fanotify_init: %w", err)
 	}
+	return fd, nil
+}
+
+// New starts a listener on the group inherited from the monitor process
+// (GroupEnv), or on a new group.
+func New(handler Handler, policy Policy, log *slog.Logger) (*Listener, error) {
 	if log == nil {
 		log = slog.Default()
 	}
-	l := &Listener{fd: fd, handler: handler, policy: policy, log: log}
+	fd, inherited, err := group()
+	if err != nil {
+		return nil, err
+	}
+	wake, err := unix.Eventfd(0, unix.EFD_CLOEXEC|unix.EFD_NONBLOCK)
+	if err != nil {
+		unix.Close(fd)
+		return nil, fmt.Errorf("eventfd: %w", err)
+	}
+	l := &Listener{fd: fd, wake: wake, handler: handler, policy: policy, log: log}
 	l.self.Store(int32(os.Getpid()))
+	if inherited {
+		l.clearStale()
+	}
 	return l, nil
+}
+
+func group() (fd int, inherited bool, err error) {
+	s := os.Getenv(GroupEnv)
+	if s == "" {
+		fd, err := NewGroup()
+		return fd, false, err
+	}
+	n, err := strconv.Atoi(s)
+	if err != nil {
+		return -1, false, fmt.Errorf("%s=%q: %w", GroupEnv, s, err)
+	}
+	// A duplicate, so that closing the listener leaves the inherited group
+	// alone.
+	fd, err = unix.FcntlInt(uintptr(n), unix.F_DUPFD_CLOEXEC, 0)
+	if err != nil {
+		return -1, false, fmt.Errorf("inherited fanotify group (fd %d): %w", n, err)
+	}
+	return fd, true, nil
+}
+
+// clearStale answers the permission events that an earlier sync process
+// read but did not answer before it died. Their accessors fail with EIO
+// (the download they waited for was lost); events that were queued but
+// never read are served normally. Responses are matched by event fd number
+// alone, so this must happen before this process reads any event: a new
+// event could otherwise share a stale one's number, and an answer meant for
+// it would release the stale one instead.
+func (l *Listener) clearStale() {
+	var rl unix.Rlimit
+	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rl); err != nil || rl.Cur > 1<<22 {
+		rl.Cur = 1 << 22
+	}
+	var r [8]byte
+	binary.LittleEndian.PutUint32(r[4:], responses(unix.EIO)[0])
+	n := 0
+	start := time.Now()
+	for fd := uint64(0); fd < rl.Cur; fd++ {
+		binary.LittleEndian.PutUint32(r[0:], uint32(fd))
+		if _, err := unix.Write(l.fd, r[:]); err == nil {
+			n++
+		}
+	}
+	log := l.log.Debug
+	if n > 0 {
+		log = l.log.Warn
+	}
+	log("Resumed the on-demand group from the previous process; interrupted downloads fail with EIO",
+		"interrupted", n, "checked", rl.Cur, "duration", time.Since(start).Round(time.Millisecond))
 }
 
 // AddView starts serving a folder: it marks every placeholder under
@@ -269,7 +352,14 @@ func (l *Listener) Close() error {
 			_ = UnmountView(v.Path)
 			unix.Close(v.private)
 		}
+		var one [8]byte
+		binary.LittleEndian.PutUint64(one[:], 1)
+		_, _ = unix.Write(l.wake, one[:])
+		l.fdMu.Lock()
+		l.closed = true
 		l.closeErr = unix.Close(l.fd)
+		unix.Close(l.wake)
+		l.fdMu.Unlock()
 	})
 	return l.closeErr
 }
@@ -354,13 +444,24 @@ func (l *Listener) Serve(ctx context.Context) error {
 	}()
 	buf := make([]byte, 64<<10)
 	for {
+		// Wait without holding the lock, then read (non-blocking) only if
+		// not closed: an event read here is ours to answer, so a closing
+		// listener must not take one.
+		fds := []unix.PollFd{{Fd: int32(l.fd), Events: unix.POLLIN}, {Fd: int32(l.wake), Events: unix.POLLIN}}
+		if _, err := unix.Poll(fds, -1); err != nil && !errors.Is(err, unix.EINTR) {
+			l.log.Warn("fanotify poll failed", "error", err)
+			time.Sleep(10 * time.Millisecond)
+		}
+		l.fdMu.RLock()
+		if l.closed {
+			l.fdMu.RUnlock()
+			return ctx.Err()
+		}
 		n, err := unix.Read(l.fd, buf)
+		l.fdMu.RUnlock()
 		if err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
-			}
-			if errors.Is(err, unix.EBADF) {
-				return fmt.Errorf("fanotify read: %w", err)
 			}
 			// Never stop serving while the marks exist: every access to a
 			// placeholder would wait forever.
@@ -399,7 +500,13 @@ func (l *Listener) handle(ctx context.Context, md unix.FanotifyEventMetadata) {
 		var r [8]byte
 		binary.LittleEndian.PutUint32(r[0:], uint32(md.Fd))
 		binary.LittleEndian.PutUint32(r[4:], resp)
+		l.fdMu.RLock()
+		if l.closed {
+			l.fdMu.RUnlock()
+			return // a shared group keeps it pending for the next listener
+		}
 		_, err := unix.Write(l.fd, r[:])
+		l.fdMu.RUnlock()
 		if err == nil {
 			return
 		}

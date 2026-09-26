@@ -40,3 +40,15 @@ func unmountStaleOnDemandViews() {
 	}
 	_ = os.Remove(path)
 }
+
+// onDemandGroup creates the fanotify group that every sync process inherits
+// (hsm.NewGroup), or returns nil where on-demand files are unavailable (old
+// kernel, no CAP_SYS_ADMIN).
+func onDemandGroup() *os.File {
+	fd, err := hsm.NewGroup()
+	if err != nil {
+		slog.Debug("No shared on-demand group", slogutil.Error(err))
+		return nil
+	}
+	return os.NewFile(uintptr(fd), "fanotify-group")
+}

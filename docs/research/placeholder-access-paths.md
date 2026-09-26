@@ -1,7 +1,7 @@
 # Placeholders read from other mount namespaces: survey, spikes and options
 
-**Status:** option 1 (per-placeholder inode marks) is implemented; see §8. The daemon-down guards (options 4–6) are
-not yet.
+**Status:** option 1 (per-placeholder inode marks) and option 6 (the monitor holds the fanotify group across sync
+process restarts) are implemented; see §8. The guards for a stopped service (options 4 and 5) are not yet.
 
 Problem: tether marks one mount, the view, with a fanotify mount mark. A mount mark belongs to that one mount. Any copy of
 it in another mount namespace has no mark, and a placeholder read through that copy returns zeros:
@@ -226,6 +226,27 @@ What the implementation found beyond the spikes:
     - a read-only mount;
     - eviction under a lease finishing promptly;
   - the e2e test `other_mount_namespace_hydrates`, which fails on the previous release.
+
+## 9. Implementation notes (option 6)
+
+Prior art: the group lives while any process holds it, like `/dev/fuse` in FUSE's fd-store recovery pattern and in
+Nydus's failover. Upstream's `FAN_CONTROL_FD` (restartable permission events) would re-queue in-flight events, but it is
+unmerged as of September 2026.
+
+- **Handover:** the monitor creates the group and passes it to each sync process as fd 3 (`TETHER_HSM_GROUP_FD`). A
+  crashed sync process leaves the marks and the queue intact. The view stays mounted, and accesses wait until the next
+  process reads them.
+- **Stale events:** events the dead process had read are matched only by event fd number, so a new event could share
+  a stale one's number. Before its first read, a restarted process therefore answers every possible number (up to
+  `RLIMIT_NOFILE`, 524,288 here) with `EIO`. That takes about 40 ms. Nydus instead journals in-flight requests to retry
+  them, which is a possible refinement.
+- **Closing without taking events:** closing an fd does not wake a thread blocked in `read()` on it, so a closing
+  listener could take one more event and strand it. The listener now polls the group together with an eventfd and
+  reads without blocking under a lock that `Close` takes.
+- **Measured on V8:**
+  - `kill -9` during 16 parallel readers whose working directory was inside the view: 16 downloads in flight failed
+    with `EIO`, 19,800 reads succeeded, none read zeros. Before: 11,200 zero-filled reads.
+  - e2e `crash_keeps_placeholders_guarded`: 20 of 60 files read as zeros on the previous commit, 0 now.
 
 ## Sources
 

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -441,5 +442,98 @@ func TestOpenForWriteReadOnlyFile(t *testing.T) {
 	st, _ := os.Stat(path)
 	if string(got) != "written" || st.Mode().Perm() != 0o444 {
 		t.Fatalf("content %q, mode %v", got, st.Mode().Perm())
+	}
+}
+
+// blockingHandler takes events and never answers them, like a sync process
+// about to crash.
+type blockingHandler struct{ took chan string }
+
+func (h blockingHandler) Hydrate(ctx context.Context, _, name string, _ *os.File) error {
+	h.took <- name
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// The group outlives a listener that dies mid-hydration (the monitor holds
+// it): the interrupted access fails with EIO, accesses in the gap wait, and
+// the next listener serves them. Nothing reads zeros.
+func TestGroupSurvivesListener(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root")
+	}
+	g, err := NewGroup()
+	if err != nil {
+		t.Skip(err)
+	}
+	defer unix.Close(g)
+	t.Setenv(GroupEnv, strconv.Itoa(g))
+	base := t.TempDir()
+	lower, view := filepath.Join(base, "lower"), filepath.Join(base, "view")
+	os.MkdirAll(lower, 0o755)
+
+	// Listener A takes x and dies without answering.
+	blocked := blockingHandler{took: make(chan string, 1)}
+	a, err := New(blocked, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.self.Store(-1)
+	if err := a.AddView(&View{Folder: "f", Lower: lower, Path: view}); err != nil {
+		t.Skipf("filesystem without HSM support? %v", err)
+	}
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	go a.Serve(ctxA)
+	content := []byte("survived")
+	placeholder(t, a, lower, "x", int64(len(content)))
+	placeholder(t, a, lower, "y", int64(len(content)))
+	type result struct {
+		out []byte
+		err error
+	}
+	cat := func(path string) chan result {
+		c := make(chan result, 1)
+		go func() {
+			out, err := exec.Command("cat", path).Output()
+			c <- result{out, err}
+		}()
+		return c
+	}
+	interrupted := cat(filepath.Join(lower, "x"))
+	if name := <-blocked.took; name != "x" {
+		t.Fatalf("took %q", name)
+	}
+	a.Close() // the crash: x's event stays pending in the group
+
+	gap := cat(filepath.Join(lower, "y"))
+	select {
+	case r := <-gap:
+		t.Fatalf("access during the gap returned %q, %v; want it to wait", r.out, r.err)
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// Listener B resumes the group.
+	h := &mapHandler{data: map[string][]byte{"f/x": content, "f/y": content}}
+	b, err := New(h, nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b.self.Store(-1)
+	if err := b.AddView(&View{Folder: "f", Lower: lower, Path: view}); err != nil {
+		t.Fatal(err)
+	}
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer func() { cancelB(); b.Close() }()
+	go b.Serve(ctxB)
+
+	if r := <-interrupted; r.err == nil {
+		t.Fatalf("interrupted access returned %q; want an error, never zeros", r.out)
+	}
+	if r := <-gap; r.err != nil || !bytes.Equal(r.out, content) {
+		t.Fatalf("access from the gap: %q, %v", r.out, r.err)
+	}
+	if got, err := os.ReadFile(filepath.Join(view, "x")); err != nil || !bytes.Equal(got, content) {
+		t.Fatalf("x after resuming: %q, %v", got, err)
 	}
 }

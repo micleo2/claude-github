@@ -56,8 +56,9 @@ tether-syncthing serve --home ~/.local/state/tether-client --no-browser
 - **Coexisting with Syncthing:** if a normal Syncthing already runs on this machine, give tether other ports. Set the
   GUI address in the config (*Settings → GUI*, or `PATCH /rest/config/gui`) rather than with `--gui-address`, which is
   not saved, so the `tether` CLI finds the right daemon. Set the sync port in `listenAddresses`.
-- **Keep the `serve` command.** It runs a small monitor process which unmounts the on-demand view if the main process
-  crashes, so placeholders are never readable as zeros from the host.
+- **Keep the `serve` command.** It runs a small monitor process that owns the fanotify group and restarts the sync
+  process if it crashes; meanwhile accesses to placeholders wait instead of reading zeros. With systemd, stop the
+  service rather than killing processes: stopping it closes the group (see *Known rough edges*).
 - **Self-upgrade is compiled out.** Syncthing's release feed would replace tether with stock Syncthing.
 
 ## 4. Pair client and server
