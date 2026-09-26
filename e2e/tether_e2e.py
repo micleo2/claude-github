@@ -683,6 +683,10 @@ def large_file(c):
 @test
 def client_restart_keeps_state(c):
     n = c.c2
+    rel = "restart/online.bin"
+    FILES[rel] = random.Random(30).randbytes(256 * 1024)
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
     before = n.status()
     run("docker", "restart", n.container)
     wait_for(lambda: n.api("GET", "/rest/system/status"), 60, what="restart")
@@ -690,7 +694,7 @@ def client_restart_keeps_state(c):
              what="view remounted")
     after = n.status()
     assert {k: v["state"] for k, v in before.items()} == {k: v["state"] for k, v in after.items()}
-    rel = next(k for k, v in after.items() if v["state"] == "online-only" and k in FILES and FILES[k])
+    assert after[rel]["state"] == "online-only"
     assert n.view_sha(rel) == sha(FILES[rel])
 
 
@@ -766,6 +770,33 @@ def placeholder_metadata_vs_remote_content_conflict(c):
         return got == sha(FILES[rel])
     wait_for(readable, 30, interval=1, what="c1 reads the winning version")
 
+
+
+@test
+def cli(c):
+    """The tether CLI resolves view paths and drives pin/unpin/evict/hydrate/status."""
+    n = c.c2
+    rel = "cli/doc.txt"
+    FILES[rel] = b"cli test\n"
+    c.write_server(rel, FILES[rel])
+    c.wait_placeholder(n, rel)
+    t = "/opt/tether/tether --home /data/home"
+    out = n.sh(f"{t} status {VIEW}/cli").stdout
+    assert "online-only" in out and "cli/doc.txt" in out, out
+    out = n.sh(f"{t} hydrate {VIEW}/cli").stdout
+    assert "hydrate: 1 files" in out, out
+    assert not n.is_placeholder(rel)
+    out = n.sh(f"{t} evict {VIEW}/cli/doc.txt").stdout
+    assert "evict: 1 files" in out, out
+    assert n.is_placeholder(rel)
+    n.sh(f"{t} pin {VIEW}/cli")
+    assert not n.is_placeholder(rel)
+    assert "pinned" in n.sh(f"{t} status {VIEW}/cli").stdout
+    n.sh(f"{t} unpin {VIEW}/cli")
+    # the real (lower) path works too
+    assert "local" in n.sh(f"{t} status {LOWER}/cli").stdout
+    p = n.sh(f"{t} status /tmp", check=False)
+    assert p.returncode != 0 and "not inside an on-demand folder" in p.stderr, p.stderr
 
 
 @test
